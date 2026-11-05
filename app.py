@@ -17,8 +17,7 @@ st.title("🎬 Manga & Story Studio: Automatización Completa")
 st.sidebar.header("🔑 Configuración")
 gemini_key = st.sidebar.text_input("Gemini API Key (Google AI Studio)", type="password")
 telegram_token = st.sidebar.text_input("Telegram Bot Token (Opcional para VoBo)", type="password")
-telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", type="text")
-
+telegram_chat_id = st.sidebar.text_input("Telegram Chat ID")
 # Carpetas de trabajo
 os.makedirs("temp_cloud", exist_ok=True)
 os.makedirs("output_cloud", exist_ok=True)
