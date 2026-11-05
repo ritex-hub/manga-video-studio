@@ -4,3 +4,5 @@ edge-tts
 google-genai
 pillow
 opencv-python-headless
+requests
+urllib3
