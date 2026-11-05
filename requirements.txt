@@ -1,0 +1,6 @@
+streamlit
+pymupdf
+edge-tts
+google-genai
+pillow
+opencv-python-headless
