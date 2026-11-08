@@ -1,37 +1,43 @@
 import os
 import time
+import asyncio
 import requests
 import numpy as np
 from PIL import Image
 import streamlit as st
 
-# Importaciones condicionales para procesamiento multimedia
+# Importaciones condicionales para procesamiento de video y voz
 try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
 
 try:
-    from moviepy.editor import ImageClip
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+try:
+    from moviepy.editor import ImageClip, AudioFileClip
 except ImportError:
     ImageClip = None
+    AudioFileClip = None
 
-st.set_page_config(page_title="Manga & Story Studio", layout="wide", page_icon="🎬")
+st.set_page_config(page_title="Manga & Story Studio Pro", layout="wide", page_icon="🎬")
 
 # ==============================================================================
-# 1. GESTIÓN AUTOMÁTICA DE SECRETOS Y CONFIGURACIÓN
+# 1. GESTIÓN AUTOMÁTICA DE SECRETOS
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
-    """Recupera variables desde st.secrets de manera segura sin interrumpir la app."""
     try:
         val = st.secrets[section][key]
         return str(val) if val is not None else default
     except Exception:
         return default
 
-# Carga de credenciales por defecto desde Secrets
 DEFAULT_GEMINI_KEY = get_secret("gemini", "api_key", get_secret("general", "gemini_api_key"))
+DEFAULT_HF_TOKEN = get_secret("huggingface", "api_token")
 DEFAULT_TG_TOKEN = get_secret("telegram", "bot_token")
 DEFAULT_TG_CHAT = get_secret("telegram", "chat_id")
 
@@ -40,7 +46,6 @@ DEFAULT_CLIENT_SECRET = get_secret("tiktok", "client_secret", "0rdY9yBOfMMkmTLLw
 DEFAULT_ACCESS_TOKEN = get_secret("tiktok", "access_token", "act.cuwQeEcQPrfg91SURpGkVe2bhSRAZyyGKVbCPsai75zbKqWtjvQ6OqgiWdIh!5618.s1")
 DEFAULT_REFRESH_TOKEN = get_secret("tiktok", "refresh_token", "rft.z05jQNXtC24zqLNoBEAHsuMTpLSOBDbTKj1APHeTiwvVlcyUMngx6W9iSdnR!5635.s1")
 
-# Inicialización de estado en sesión para TikTok
 if "tiktok_access_token" not in st.session_state:
     st.session_state["tiktok_access_token"] = DEFAULT_ACCESS_TOKEN
 
@@ -49,12 +54,11 @@ if "tiktok_refresh_token" not in st.session_state:
 
 
 # ==============================================================================
-# 2. VALIDACIONES EN VIVO (GEMINI & TELEGRAM)
+# 2. VALIDACIONES DE CONEXIONES EN VIVO
 # ==============================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def verify_gemini_api_key(api_key: str):
-    """Valida la API Key de Google Gemini consultando el endpoint de modelos."""
     if not api_key or len(api_key.strip()) < 10:
         return False, "Clave vacía o incompleta"
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key.strip()}"
@@ -63,15 +67,29 @@ def verify_gemini_api_key(api_key: str):
         if res.status_code == 200:
             return True, "API Key válida y conectada"
         data = res.json()
-        error_msg = data.get("error", {}).get("message", "Clave no válida")
-        return False, error_msg
+        return False, data.get("error", {}).get("message", "Clave no válida")
+    except Exception as e:
+        return False, f"Error de conexión: {str(e)}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def verify_hf_token(token: str):
+    if not token or not token.startswith("hf_"):
+        return False, "Token con formato inválido (debe iniciar con hf_)"
+    url = "https://huggingface.co/api/whoami-v2"
+    headers = {"Authorization": f"Bearer {token.strip()}"}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            user = res.json().get("name", "Usuario HF")
+            return True, f"Conectado a Hugging Face ({user})"
+        return False, "Token inválido o sin permisos"
     except Exception as e:
         return False, f"Error de conexión: {str(e)}"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def verify_telegram_bot_token(bot_token: str):
-    """Valida el Bot Token de Telegram invocando getMe."""
     if not bot_token or ":" not in bot_token:
         return False, "Formato de token inválido", None
     url = f"https://api.telegram.org/bot{bot_token.strip()}/getMe"
@@ -87,15 +105,13 @@ def verify_telegram_bot_token(bot_token: str):
 
 
 def verify_telegram_chat_id(bot_token: str, chat_id: str):
-    """Valida si el bot de Telegram tiene acceso al chat del usuario."""
     if not chat_id or not str(chat_id).strip():
         return False, "Chat ID no proporcionado"
     clean_id = str(chat_id).strip()
     if not (clean_id.isdigit() or (clean_id.startswith("-") and clean_id[1:].isdigit())):
         return False, "El Chat ID debe ser numérico"
     if not bot_token:
-        return False, "Se requiere un Bot Token válido primero"
-
+        return False, "Se requiere Bot Token previo"
     url = f"https://api.telegram.org/bot{bot_token.strip()}/getChat?chat_id={clean_id}"
     try:
         res = requests.get(url, timeout=5)
@@ -103,13 +119,12 @@ def verify_telegram_chat_id(bot_token: str, chat_id: str):
         if res.status_code == 200 and data.get("ok"):
             chat_name = data["result"].get("first_name") or data["result"].get("title") or "Chat privado"
             return True, f"Chat verificado: {chat_name}"
-        return False, data.get("description", "Chat ID no encontrado o bot sin iniciar")
+        return False, data.get("description", "Chat no encontrado o bot sin iniciar")
     except Exception as e:
-        return False, f"Error de conexión: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 def send_telegram_notification(bot_token: str, chat_id: str, message: str, video_path: str = None):
-    """Envía un mensaje o video de confirmación a Telegram."""
     if not bot_token or not chat_id:
         return False, "Faltan credenciales de Telegram"
     try:
@@ -118,7 +133,7 @@ def send_telegram_notification(bot_token: str, chat_id: str, message: str, video
             with open(video_path, "rb") as vf:
                 files = {"video": vf}
                 data = {"chat_id": chat_id.strip(), "caption": message}
-                res = requests.post(url, files=files, data=data, timeout=60)
+                res = requests.post(url, files=files, data=data, timeout=90)
         else:
             url = f"https://api.telegram.org/bot{bot_token.strip()}/sendMessage"
             payload = {"chat_id": chat_id.strip(), "text": message}
@@ -129,11 +144,65 @@ def send_telegram_notification(bot_token: str, chat_id: str, message: str, video
 
 
 # ==============================================================================
-# 3. LÓGICA DE TIKTOK CONTENT POSTING API V2
+# 3. GENERACIÓN DE IMAGEN Y VOZ GRATIS (HF + EDGE-TTS)
+# ==============================================================================
+
+def generate_image_hf(prompt: str, token: str, output_path: str):
+    """Genera una imagen con IA gratuita usando el endpoint de Hugging Face."""
+    # Usamos Stability AI SDXL base o FLUX-schnell
+    api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    headers = {"Authorization": f"Bearer {token.strip()}"}
+    payload = {
+        "inputs": f"{prompt}, manhwa style, comic art, high action, cinematic lighting, 8k, vertical 9:16 composition",
+        "parameters": {"negative_prompt": "blurry, low quality, distorted, extra limbs, bad anatomy"}
+    }
+    
+    response = requests.post(api_url, headers=headers, json=payload, timeout=90)
+    if response.status_code == 200:
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        return True, output_path
+    else:
+        return False, f"Error HF ({response.status_code}): {response.text}"
+
+
+async def generate_speech_edge(text: str, voice: str, output_path: str):
+    """Genera audio mp3 ultrarrealista sin coste con edge-tts."""
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+
+
+def create_vertical_video_clip(image_path: str, audio_path: str, output_video_path: str):
+    """Combina la imagen 9:16 con el audio y genera el clip MP4 final."""
+    target_w, target_h = 1080, 1920
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+    
+    scale = max(target_w / w, target_h / h)
+    nw, nh = int(w * scale), int(h * scale)
+    img_resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    
+    # Centrar recorte vertical
+    left = (nw - target_w) // 2
+    top = (nh - target_h) // 2
+    img_cropped = img_resized.crop((left, top, left + target_w, top + target_h))
+    
+    audio_clip = AudioFileClip(audio_path)
+    duration = audio_clip.duration + 0.5
+    
+    # Crear clip con movimiento sutil (zoom in)
+    clip = ImageClip(np.array(img_cropped)).set_duration(duration)
+    video = clip.set_audio(audio_clip)
+    video.write_videofile(output_video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    audio_clip.close()
+    return output_video_path
+
+
+# ==============================================================================
+# 4. TIKTOK CONTENT POSTING API V2
 # ==============================================================================
 
 def renew_tiktok_token():
-    """Renueva el access_token utilizando el refresh_token permanente."""
     url = "https://open.tiktokapis.com/v2/oauth/token/"
     payload = {
         "client_key": DEFAULT_CLIENT_KEY,
@@ -142,7 +211,6 @@ def renew_tiktok_token():
         "refresh_token": st.session_state["tiktok_refresh_token"],
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     try:
         res = requests.post(url, headers=headers, data=payload, timeout=20)
         data = res.json()
@@ -151,29 +219,25 @@ def renew_tiktok_token():
             if "refresh_token" in data:
                 st.session_state["tiktok_refresh_token"] = data["refresh_token"]
             return data["access_token"]
-        else:
-            st.error(f"Fallo al renovar token de TikTok: {data}")
-            return None
-    except Exception as e:
-        st.error(f"Error de red al renovar token: {e}")
+        return None
+    except Exception:
         return None
 
 
 def upload_video_to_tiktok(video_path: str):
-    """Sube un video MP4 a TikTok v2 directo a borradores/inbox."""
     if not os.path.exists(video_path):
-        raise FileNotFoundError(f"No existe el archivo de video: {video_path}")
+        raise FileNotFoundError(f"Archivo inexistente: {video_path}")
 
     file_size = os.path.getsize(video_path)
     access_token = st.session_state["tiktok_access_token"]
 
-    def _initiate_post(token):
-        init_url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
-        headers = {
+    def _init(token):
+        url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+        h = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=UTF-8",
         }
-        body = {
+        b = {
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": file_size,
@@ -181,17 +245,16 @@ def upload_video_to_tiktok(video_path: str):
                 "total_chunk_count": 1,
             }
         }
-        return requests.post(init_url, headers=headers, json=body, timeout=30)
+        return requests.post(url, headers=h, json=b, timeout=30)
 
-    res_init = _initiate_post(access_token)
+    res_init = _init(access_token)
     init_data = res_init.json()
 
     if init_data.get("error", {}).get("code") in ["access_token_invalid", "token_expired", "invalid_token"]:
-        st.warning("El token de TikTok ha expirado. Renovando automáticamente...")
         access_token = renew_tiktok_token()
         if not access_token:
-            raise Exception("No se pudo renovar el token de TikTok.")
-        res_init = _initiate_post(access_token)
+            raise Exception("No se pudo renovar token de TikTok.")
+        res_init = _init(access_token)
         init_data = res_init.json()
 
     if init_data.get("error", {}).get("code") != "ok":
@@ -209,287 +272,241 @@ def upload_video_to_tiktok(video_path: str):
         res_upload = requests.put(upload_url, headers=upload_headers, data=vf, timeout=120)
 
     if res_upload.status_code not in (200, 201, 206):
-        raise Exception(f"Error subiendo bytes a TikTok: {res_upload.status_code} - {res_upload.text}")
+        raise Exception(f"Error subiendo bytes a TikTok: {res_upload.status_code}")
 
     return publish_id
 
 
 # ==============================================================================
-# 4. BARRA LATERAL (CONFIGURACIÓN EN VIVO)
+# 5. BARRA LATERAL (CONFIGURACIÓN)
 # ==============================================================================
 
 st.sidebar.title("🔑 Configuración")
 
-# --- 4.1. Gemini API Key ---
-gemini_key = st.sidebar.text_input(
-    "Gemini API Key",
-    value=DEFAULT_GEMINI_KEY,
-    type="password",
-    help="Configurada en secrets o desde Google AI Studio"
-)
-
+# 1. Gemini
+gemini_key = st.sidebar.text_input("Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
 if gemini_key:
-    is_gemini_ok, gemini_msg = verify_gemini_api_key(gemini_key)
-    if is_gemini_ok:
-        st.sidebar.success(f"✅ {gemini_msg}")
+    ok_gem, msg_gem = verify_gemini_api_key(gemini_key)
+    if ok_gem:
+        st.sidebar.success(f"✅ {msg_gem}")
     else:
-        st.sidebar.error(f"❌ {gemini_msg}")
+        st.sidebar.error(f"❌ {msg_gem}")
 else:
     st.sidebar.info("ℹ️ Ingresa tu clave de Gemini")
 
+# 2. Hugging Face
+hf_token = st.sidebar.text_input("Hugging Face Token", value=DEFAULT_HF_TOKEN, type="password", help="Para generar imágenes gratis")
+hf_is_valid = False
+if hf_token:
+    ok_hf, msg_hf = verify_hf_token(hf_token)
+    if ok_hf:
+        st.sidebar.success(f"✅ {msg_hf}")
+        hf_is_valid = True
+    else:
+        st.sidebar.error(f"❌ {msg_hf}")
+else:
+    st.sidebar.info("ℹ️ Agrega tu Token de Hugging Face")
+
 st.sidebar.markdown("---")
 
-# --- 4.2. Telegram Bot Token & Chat ID ---
-telegram_token = st.sidebar.text_input(
-    "Telegram Bot Token",
-    value=DEFAULT_TG_TOKEN,
-    type="password",
-    help="Token configurado en secrets o proporcionado por @BotFather"
-)
-
+# 3. Telegram
+telegram_token = st.sidebar.text_input("Telegram Bot Token", value=DEFAULT_TG_TOKEN, type="password")
 bot_is_valid = False
 if telegram_token:
-    is_tg_ok, tg_msg, bot_user = verify_telegram_bot_token(telegram_token)
-    if is_tg_ok:
-        st.sidebar.success(f"✅ {tg_msg}")
+    ok_tg, msg_tg, _ = verify_telegram_bot_token(telegram_token)
+    if ok_tg:
+        st.sidebar.success(f"✅ {msg_tg}")
         bot_is_valid = True
     else:
-        st.sidebar.error(f"❌ {tg_msg}")
+        st.sidebar.error(f"❌ {msg_tg}")
 
-telegram_chat_id = st.sidebar.text_input(
-    "Telegram Chat ID",
-    value=DEFAULT_TG_CHAT,
-    help="ID numérico de Telegram (ej. 8870484184)"
-)
-
+telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=DEFAULT_TG_CHAT)
 chat_is_valid = False
 if telegram_chat_id:
     if bot_is_valid:
-        is_chat_ok, chat_msg = verify_telegram_chat_id(telegram_token, telegram_chat_id)
-        if is_chat_ok:
-            st.sidebar.success(f"✅ {chat_msg}")
+        ok_chat, msg_chat = verify_telegram_chat_id(telegram_token, telegram_chat_id)
+        if ok_chat:
+            st.sidebar.success(f"✅ {msg_chat}")
             chat_is_valid = True
         else:
-            st.sidebar.error(f"❌ {chat_msg}")
+            st.sidebar.error(f"❌ {msg_chat}")
     else:
-        st.sidebar.warning("⚠️ Ingresa un Bot Token válido para comprobar el Chat ID")
+        st.sidebar.warning("⚠️ Primero ingresa un Bot Token válido")
 
 st.sidebar.markdown("---")
 
-# --- 4.3. Estado de TikTok ---
+# 4. TikTok
 st.sidebar.subheader("🎵 Estado de TikTok")
-
 if st.session_state["tiktok_access_token"]:
     st.sidebar.success("✅ Conectado a TikTok")
     if st.sidebar.button("🔄 Refrescar Token"):
-        new_token = renew_tiktok_token()
-        if new_token:
+        new_tok = renew_tiktok_token()
+        if new_tok:
             st.sidebar.info("Token renovado con éxito")
 else:
     st.sidebar.warning("⚠️ Sin token activo")
 
 
 # ==============================================================================
-# 5. PANELES Y FLUJOS PRINCIPALES
+# 6. PESTAÑAS PRINCIPALES DE TRABAJO
 # ==============================================================================
 
-st.title("🎬 Manga & Story Studio: Automatización Completa")
+st.title("🎬 Manga & Story Studio: Generación y Publicación Autónoma")
 
 tabs = st.tabs([
-    "📖 1. Animación de Manga (PDF)", 
-    "📝 2. Historias / Temas", 
-    "🚀 3. TikTok Uploader"
+    "🤖 1. Productor IA Autónomo (Guion + Voz + Imagen)", 
+    "📖 2. Animador de Manga (PDF)", 
+    "🚀 3. TikTok Uploader Directo"
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: Animación de Manga / Manhwa PDF
+# PESTAÑA 1: Flujo Autónomo Completo
 # ------------------------------------------------------------------------------
 with tabs[0]:
-    st.subheader("Animación Dinámica de Viñetas (Formato Vertical 9:16)")
-    pdf_file = st.file_uploader("Sube el PDF del Manga o Manhwa", type=["pdf"])
-    
-    if pdf_file:
-        if fitz is None or ImageClip is None:
-            st.error("Para animar viñetas asegúrate de tener instalados `pymupdf` y `moviepy` en requirements.txt.")
-        else:
-            st.success("Archivo PDF cargado correctamente.")
-            col_a, col_b = st.columns([1, 2])
-            with col_a:
-                page_num = st.number_input("Número de página a procesar", min_value=1, value=1, step=1)
-                duration = st.slider("Duración del video (segundos)", min_value=3, max_value=15, value=6)
-                btn_animate = st.button("🎞️ Convertir Página a Video 9:16", type="primary")
-                
-            if btn_animate:
-                with st.spinner("Extrayendo viñetas y generando barrido cinematográfico vertical..."):
-                    try:
-                        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-                        if page_num > len(doc):
-                            st.error(f"El PDF solo contiene {len(doc)} páginas.")
-                        else:
-                            page = doc[page_num - 1]
-                            pix = page.get_pixmap(dpi=200)
-                            img_path = f"/tmp/page_{page_num}.png" if os.name != "nt" else f"page_{page_num}.png"
-                            pix.save(img_path)
-                            
-                            # Cargar imagen y ajustar a lienzo vertical 9:16 (1080x1920)
-                            pil_img = Image.open(img_path).convert("RGB")
-                            w, h = pil_img.size
-                            target_w, target_h = 1080, 1920
-                            
-                            # Escalar proporcional al ancho vertical
-                            scale = target_w / float(w)
-                            new_h = int(h * scale)
-                            pil_img_resized = pil_img.resize((target_w, new_h), Image.Resampling.LANCZOS)
-                            
-                            # Si es más alto que 1920, realizamos un barrido de arriba a abajo
-                            video_output = f"/tmp/manga_anim_{page_num}.mp4" if os.name != "nt" else f"manga_anim_{page_num}.mp4"
-                            
-                            if new_h > target_h:
-                                max_scroll = new_h - target_h
-                                def make_frame(t):
-                                    y_offset = int((t / duration) * max_scroll)
-                                    cropped = pil_img_resized.crop((0, y_offset, target_w, y_offset + target_h))
-                                    return np.array(cropped)
-                                
-                                clip = ImageClip(np.array(pil_img_resized.crop((0, 0, target_w, target_h)))).set_duration(duration)
-                                video = clip.fl(lambda gf, t: make_frame(t))
-                            else:
-                                # Centrar sobre fondo negro
-                                bg = Image.new("RGB", (target_w, target_h), (10, 10, 10))
-                                y_pos = (target_h - new_h) // 2
-                                bg.paste(pil_img_resized, (0, y_pos))
-                                video = ImageClip(np.array(bg)).set_duration(duration)
-                                
-                            video.write_videofile(video_output, fps=24, codec="libx264", audio=False, verbose=False, logger=None)
-                            
-                            st.success("¡Video vertical 9:16 generado con éxito!")
-                            st.video(video_output)
-                            
-                            # Guardar ruta en sesión para publicación directa
-                            st.session_state["latest_video_path"] = video_output
-                            
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                with open(video_output, "rb") as f:
-                                    st.download_button("📥 Descargar Video MP4", data=f, file_name=f"manga_scene_{page_num}.mp4", mime="video/mp4")
-                            with c2:
-                                if chat_is_valid and st.button("📲 Enviar a mi Telegram"):
-                                    ok, resp = send_telegram_notification(telegram_token, telegram_chat_id, f"🎬 Animación generada: Página {page_num}", video_output)
-                                    if ok:
-                                        st.success("Video enviado a tu Telegram.")
-                                    else:
-                                        st.error(f"Fallo al enviar a Telegram: {resp}")
-                    except Exception as err:
-                        st.error(f"Error procesando la animación del manga: {str(err)}")
-
-# ------------------------------------------------------------------------------
-# PESTAÑA 2: Generación de Historias y Guiones IA (Gemini)
-# ------------------------------------------------------------------------------
-with tabs[1]:
-    st.subheader("Generación de Historias y Guiones IA")
+    st.subheader("Generador Autónomo de Video para TikTok")
     story_theme = st.text_area(
-        "Tema de la historia, idea central o resumen:",
-        value="Género: Acción, Thriller cibernético, Suspenso urbano. Protagonista: Jun-woo, un exsoldado de operaciones encubiertas que trabaja como reparador clandestino en los bajos fondos.",
-        height=100
+        "Idea Central o Sinopsis:",
+        value="Jun-woo, un exsoldado en el Seúl ciberpunk, descubre una lista de objetivos encubiertos y escapa por los techos bajo la lluvia.",
+        height=80
     )
     
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        num_scenes = st.slider("Número de Capítulos / Escenas", min_value=3, max_value=10, value=10)
-    
-    if st.button("🚀 Generar Guion y Prompts", type="primary"):
+    c_voice, c_btn = st.columns([2, 2])
+    with c_voice:
+        selected_voice = st.selectbox(
+            "Voz de Narración (Gratis con Edge-TTS):",
+            ["es-MX-JorgeNeural (Hombre - Suspenso/Acción)", "es-ES-AlvaroNeural (Hombre - Narrador)", "es-MX-DaliaNeural (Mujer - Rápido)", "es-ES-ElviraNeural (Mujer - Dramático)"]
+        )
+        voice_id = selected_voice.split(" ")[0]
+
+    if st.button("⚡ Crear Capítulo Completo (Guion + Imagen IA + Voz + Video 9:16)", type="primary"):
         if not gemini_key:
-            st.error("Por favor ingresa y valida tu Gemini API Key en la barra lateral.")
+            st.error("Se requiere la clave de Gemini en la barra lateral.")
+        elif not hf_is_valid:
+            st.error("Se requiere un Token válido de Hugging Face para generar la imagen gratis.")
         else:
-            with st.spinner("🤖 Gemini está redactando los 10 capítulos con prompts verticales..."):
-                prompt_content = f"""
-                Eres un guionista y director experto en crear historias virales de manga y webtoon de acción vertical (9:16) para TikTok.
-                
-                Basado en esta premisa:
-                "{story_theme}"
-                
-                Genera una historia dividida en exactamente {num_scenes} capítulos o escenas continuas.
-                Para CADA capítulo proporciona:
-                1. 🎬 **Título del Capítulo y Sinopsis rápida** (2-3 líneas).
-                2. 🎙️ **Voz en off / Narración** (Texto cautivador en español para narrar en 15-20 segundos).
-                3. 🎨 **Prompt de Imagen/Video (en inglés)** optimizado para Midjourney/Stable Diffusion en formato vertical 9:16 con estilo de manhwa cyberpunk de alta acción.
-                4. 📱 **Hook / Texto en pantalla** para retener a la audiencia en TikTok.
+            with st.status("Procesando creación multimedia...", expanded=True) as status:
+                # 1. Gemini: Generar narración y prompt visual
+                st.write("🧠 1. Gemini diseñando guion y prompt fotográfico...")
+                prompt_ai = f"""
+                Eres director de micro-historias de manga/webtoon para TikTok.
+                Basado en esta idea: '{story_theme}'
+                Devuelve EXACTAMENTE dos líneas:
+                NARRACION: (Texto en español impactante para narrar en 10-12 segundos).
+                PROMPT: (Prompt en inglés muy detallado para generar una imagen estilo webtoon manhwa vertical de acción).
                 """
+                url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
+                res_gem = requests.post(url_gem, headers={"Content-Type": "application/json"}, json={"contents": [{"parts": [{"text": prompt_ai}]}]}, timeout=30)
+                gem_text = res_gem.json()["candidates"][0]["content"]["parts"][0]["text"]
                 
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
-                headers = {"Content-Type": "application/json"}
-                payload = {
-                    "contents": [{
-                        "parts": [{"text": prompt_content}]
-                    }],
-                    "generationConfig": {
-                        "temperature": 0.7,
-                        "maxOutputTokens": 4000
-                    }
-                }
+                narracion = "En las sombras de la ciudad, el protocolo cero ha comenzado."
+                img_prompt = "Cyberpunk soldier jumping between neon skyscrapers in rain, manhwa artstyle"
+                for line in gem_text.split("\n"):
+                    if line.startswith("NARRACION:"):
+                        narracion = line.replace("NARRACION:", "").strip()
+                    elif line.startswith("PROMPT:"):
+                        img_prompt = line.replace("PROMPT:", "").strip()
+
+                st.info(f"🎙️ **Narración:** {narracion}")
+                st.info(f"🎨 **Prompt Visual:** {img_prompt}")
+
+                # 2. Generar Voz Gratis con Edge-TTS
+                st.write("🗣️ 2. Sintetizando voz en off realista con Edge-TTS...")
+                temp_audio = "/tmp/story_voice.mp3" if os.name != "nt" else "story_voice.mp3"
+                asyncio.run(generate_speech_edge(narracion, voice_id, temp_audio))
+
+                # 3. Generar Imagen Gratis con Hugging Face
+                st.write("🖼️ 3. Generando arte manhwa con Hugging Face (SDXL)...")
+                temp_img = "/tmp/story_img.png" if os.name != "nt" else "story_img.png"
+                ok_img, msg_img = generate_image_hf(img_prompt, hf_token, temp_img)
                 
-                try:
-                    res = requests.post(url, headers=headers, json=payload, timeout=60)
-                    data = res.json()
+                if not ok_img:
+                    st.error(f"Fallo al generar imagen: {msg_img}")
+                    status.update(label="Error en generación visual", state="error")
+                else:
+                    # 4. Ensamblar Video 9:16 con MoviePy
+                    st.write("🎬 4. Renderizando video vertical 9:16 con audio sincronizado...")
+                    final_video = "/tmp/tiktok_ready.mp4" if os.name != "nt" else "tiktok_ready.mp4"
+                    create_vertical_video_clip(temp_img, temp_audio, final_video)
                     
-                    if "candidates" in data and len(data["candidates"]) > 0:
-                        resultado_texto = data["candidates"][0]["content"]["parts"][0]["text"]
-                        st.success("✨ ¡Guion y prompts generados con éxito!")
-                        st.markdown(resultado_texto)
-                        
-                        st.download_button(
-                            label="📥 Descargar Guion Completo (TXT)",
-                            data=resultado_texto,
-                            file_name="guion_historia_manga.txt",
-                            mime="text/plain"
-                        )
-                        
-                        if chat_is_valid and st.button("📲 Enviar Guion a Telegram"):
-                            ok, resp = send_telegram_notification(telegram_token, telegram_chat_id, f"📝 Guion Generado:\n\n{resultado_texto[:3000]}")
-                            if ok:
-                                st.info("Resumen del guion enviado a tu Telegram.")
-                    else:
-                        st.error(f"Error devuelto por Gemini: {data.get('error', {}).get('message', 'Respuesta inesperada')}")
-                except Exception as ex:
-                    st.error(f"Fallo al conectar con Gemini: {str(ex)}")
+                    st.session_state["latest_video_path"] = final_video
+                    status.update(label="¡Video generado exitosamente!", state="complete")
+                    
+                    st.success("🎉 Video producido de principio a fin:")
+                    st.video(final_video)
+                    
+                    c_up1, c_up2 = st.columns(2)
+                    with c_up1:
+                        if st.button("📤 Publicar Directo en Borradores de TikTok"):
+                            pid = upload_video_to_tiktok(final_video)
+                            st.success(f"¡Subido a TikTok! Publish ID: `{pid}`")
+                            if chat_is_valid:
+                                send_telegram_notification(telegram_token, telegram_chat_id, f"✅ Video subido a TikTok.\nPublish ID: {pid}", final_video)
+                    with c_up2:
+                        if chat_is_valid and st.button("📲 Enviar Vista Previa a Telegram"):
+                            send_telegram_notification(telegram_token, telegram_chat_id, f"🎬 Previsualización de escena:\n\n{narracion}", final_video)
+                            st.success("Enviado a tu Telegram.")
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 3: Publicación Directa en TikTok
+# PESTAÑA 2: Animación de Manga PDF
+# ------------------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("Animación Dinámica de Viñetas desde PDF")
+    pdf_file = st.file_uploader("Sube el PDF del Manga o Manhwa", type=["pdf"])
+    if pdf_file and fitz:
+        page_num = st.number_input("Página a animar", min_value=1, value=1)
+        dur = st.slider("Duración (segundos)", 3, 12, 6)
+        if st.button("Animar Página"):
+            doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+            if page_num <= len(doc):
+                pix = doc[page_num - 1].get_pixmap(dpi=200)
+                temp_p = f"/tmp/p_{page_num}.png" if os.name != "nt" else f"p_{page_num}.png"
+                pix.save(temp_p)
+                
+                # Barrido vertical continuo
+                pil_i = Image.open(temp_p).convert("RGB")
+                target_w, target_h = 1080, 1920
+                scale = target_w / float(pil_i.size[0])
+                nh = int(pil_i.size[1] * scale)
+                pil_res = pil_i.resize((target_w, nh), Image.Resampling.LANCZOS)
+                
+                out_p = f"/tmp/manga_scroll_{page_num}.mp4" if os.name != "nt" else f"manga_scroll_{page_num}.mp4"
+                if nh > target_h:
+                    max_scroll = nh - target_h
+                    clip = ImageClip(np.array(pil_res.crop((0, 0, target_w, target_h)))).set_duration(dur)
+                    vid = clip.fl(lambda gf, t: np.array(pil_res.crop((0, int((t/dur)*max_scroll), target_w, int((t/dur)*max_scroll)+target_h))))
+                else:
+                    bg = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+                    bg.paste(pil_res, (0, (target_h - nh)//2))
+                    vid = ImageClip(np.array(bg)).set_duration(dur)
+                    
+                vid.write_videofile(out_p, fps=24, codec="libx264", audio=False, verbose=False, logger=None)
+                st.session_state["latest_video_path"] = out_p
+                st.video(out_p)
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 3: Subida Manual a TikTok
 # ------------------------------------------------------------------------------
 with tabs[2]:
-    st.subheader("Publicación Directa en TikTok (Sandbox / Producción)")
+    st.subheader("Subida Directa a TikTok (Borradores)")
+    manual_vid = st.file_uploader("Selecciona archivo MP4", type=["mp4"])
     
-    # Opción de usar el video generado en la pestaña 1 o subir uno propio
-    use_latest = False
-    if "latest_video_path" in st.session_state and os.path.exists(st.session_state["latest_video_path"]):
-        use_latest = st.checkbox("Usar el último video animado desde la Pestaña 1", value=True)
-        if use_latest:
-            st.video(st.session_state["latest_video_path"])
-            target_upload_path = st.session_state["latest_video_path"]
-            
-    if not use_latest:
-        uploaded_video = st.file_uploader("O selecciona un video MP4 de tu equipo", type=["mp4"])
-        if uploaded_video:
-            temp_dir = "/tmp" if os.name != "nt" else "."
-            target_upload_path = os.path.join(temp_dir, uploaded_video.name)
-            with open(target_upload_path, "wb") as f:
-                f.write(uploaded_video.read())
-            st.video(target_upload_path)
-        else:
-            target_upload_path = None
-            
-    if target_upload_path:
-        if st.button("📤 Subir como Borrador a TikTok", type="primary"):
-            progress_bar = st.progress(0, text="Iniciando subida...")
-            try:
-                progress_bar.progress(25, text="Contactando con la API de TikTok v2...")
-                publish_id = upload_video_to_tiktok(target_upload_path)
-                progress_bar.progress(100, text="¡Completado!")
-                
-                st.success("🎉 ¡Video transferido con éxito a tu cuenta de TikTok!")
-                st.info(f"**Publish ID:** `{publish_id}`\n\nAbre la aplicación de TikTok en tu teléfono: ya tienes el borrador listo en tu bandeja de entrada.")
-                
-                if chat_is_valid:
-                    send_telegram_notification(telegram_token, telegram_chat_id, f"✅ Video subido a TikTok exitosamente.\nPublish ID: {publish_id}")
-            except Exception as err:
-                st.error(f"Error durante la subida a TikTok: {str(err)}")
+    path_to_send = None
+    if manual_vid:
+        temp_man = f"/tmp/{manual_vid.name}" if os.name != "nt" else manual_vid.name
+        with open(temp_man, "wb") as f:
+            f.write(manual_vid.read())
+        path_to_send = temp_man
+        st.video(path_to_send)
+    elif "latest_video_path" in st.session_state and os.path.exists(st.session_state["latest_video_path"]):
+        st.info("Usando video creado en las pestañas anteriores:")
+        path_to_send = st.session_state["latest_video_path"]
+        st.video(path_to_send)
+
+    if path_to_send and st.button("Subir ahora a TikTok"):
+        try:
+            pub_id = upload_video_to_tiktok(path_to_send)
+            st.success(f"¡Publicado en borrador con éxito! ID: `{pub_id}`")
+            if chat_is_valid:
+                send_telegram_notification(telegram_token, telegram_chat_id, f"Video enviado a TikTok: {pub_id}")
+        except Exception as e:
+            st.error(f"Error al subir: {str(e)}")
