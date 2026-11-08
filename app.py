@@ -70,7 +70,7 @@ def verify_telegram_bot_token(bot_token: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def verify_telegram_chat_id(bot_token: str, chat_id: str):
-    """Valida si el bot de Telegram tiene acceso y permisos para enviar mensajes al chat indicado."""
+    """Valida si el bot de Telegram tiene acceso al chat indicado."""
     if not chat_id or not chat_id.strip():
         return False, "Chat ID no proporcionado"
     clean_id = chat_id.strip()
@@ -187,7 +187,7 @@ def upload_video_to_tiktok(video_path: str):
 # 4. BARRA LATERAL (CONFIGURACIÓN CON INDICADORES EN TIEMPO REAL)
 # ==============================================================================
 
-st.sidebar.title("🔑 Configuración")[cite: 17, 18, 19]
+st.sidebar.title("🔑 Configuración")
 
 # --- 4.1. Gemini API Key ---
 default_gemini = get_secret("general", "gemini_api_key")
@@ -196,7 +196,7 @@ gemini_key = st.sidebar.text_input(
     value=default_gemini,
     type="password",
     help="Clave obtenida desde Google AI Studio"
-)[cite: 17, 18, 19]
+)
 
 if gemini_key:
     is_gemini_ok, gemini_msg = verify_gemini_api_key(gemini_key)
@@ -216,7 +216,7 @@ telegram_token = st.sidebar.text_input(
     value=default_tg_token,
     type="password",
     help="Token de acceso proporcionado por @BotFather"
-)[cite: 17, 18, 19]
+)
 
 bot_is_valid = False
 if telegram_token:
@@ -232,7 +232,7 @@ telegram_chat_id = st.sidebar.text_input(
     "Telegram Chat ID",
     value=default_tg_chat,
     help="Tu ID numérico de Telegram (ej. 123456789 o -100123456789)"
-)[cite: 17, 18, 19]
+)
 
 if telegram_chat_id:
     if bot_is_valid:
@@ -247,11 +247,11 @@ if telegram_chat_id:
 st.sidebar.markdown("---")
 
 # --- 4.3. Estado de TikTok ---
-st.sidebar.subheader("🎵 Estado de TikTok")[cite: 18]
+st.sidebar.subheader("🎵 Estado de TikTok")
 
 if st.session_state["tiktok_access_token"]:
-    st.sidebar.success("✅ Conectado a TikTok")[cite: 18]
-    if st.sidebar.button("🔄 Refrescar Token"):[cite: 18]
+    st.sidebar.success("✅ Conectado a TikTok")
+    if st.sidebar.button("🔄 Refrescar Token"):
         new_token = renew_tiktok_token()
         if new_token:
             st.sidebar.info("Token renovado con éxito")
@@ -263,33 +263,33 @@ else:
 # 5. PANELES Y PESTAÑAS PRINCIPALES
 # ==============================================================================
 
-st.title("🎬 Manga & Story Studio: Automatización Completa")[cite: 17, 18]
+st.title("🎬 Manga & Story Studio: Automatización Completa")
 
 tabs = st.tabs([
     "📖 1. Animación de Manga (PDF)", 
     "📝 2. Historias / Temas", 
     "🚀 3. TikTok Uploader"
-])[cite: 18]
+])
 
 # Pestaña 1: Animación de Manga
-with tabs[0]:[cite: 18]
-    st.subheader("Animación Dinámica de Viñetas")[cite: 17, 18]
-    pdf_file = st.file_uploader("Sube el PDF del Manga", type=["pdf"])[cite: 17, 18]
+with tabs[0]:
+    st.subheader("Animación Dinámica de Viñetas")
+    pdf_file = st.file_uploader("Sube el PDF del Manga", type=["pdf"])
     if pdf_file:
         st.info("Archivo recibido con éxito. Listo para la segmentación y extracción de viñetas.")
 
 # Pestaña 2: Historias / Temas
-with tabs[1]:[cite: 18]
+with tabs[1]:
     st.subheader("Generación de Historias y Guiones IA")
     story_theme = st.text_input("Tema de la historia, idea central o resumen:")
     if st.button("Generar Guion"):
         if not gemini_key:
-            st.error("Por favor ingresa y valida tu Gemini API Key en la barra lateral.")[cite: 17, 18, 19]
+            st.error("Por favor ingresa y valida tu Gemini API Key en la barra lateral.")
         else:
             st.write("Generando estructura de guion y prompts verticales...")
 
 # Pestaña 3: TikTok Uploader
-with tabs[2]:[cite: 18]
+with tabs[2]:
     st.subheader("Publicación Directa en TikTok (Sandbox / Producción)")
     uploaded_video = st.file_uploader("Selecciona el video MP4 para subir", type=["mp4"])
     
