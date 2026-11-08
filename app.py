@@ -6,23 +6,31 @@ import streamlit as st
 st.set_page_config(page_title="Manga & Story Studio", layout="wide", page_icon="🎬")
 
 # ==============================================================================
-# 1. FUNCIONES AUXILIARES Y GESTIÓN DE SECRETOS
+# 1. GESTIÓN AUTOMÁTICA DE SECRETOS Y CONFIGURACIÓN
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
-    """Recupera variables desde st.secrets de manera segura sin romper la ejecución."""
+    """Recupera variables desde st.secrets de manera segura sin interrumpir la app."""
     try:
-        return st.secrets[section][key]
+        val = st.secrets[section][key]
+        return str(val) if val is not None else default
     except Exception:
         return default
 
-# Variables de TikTok (obtenidas desde st.secrets si existen)
+# Carga automática de Gemini desde secrets
+DEFAULT_GEMINI_KEY = get_secret("gemini", "api_key", get_secret("general", "gemini_api_key"))
+
+# Carga automática de Telegram desde secrets
+DEFAULT_TG_TOKEN = get_secret("telegram", "bot_token")
+DEFAULT_TG_CHAT = get_secret("telegram", "chat_id")
+
+# Carga automática de TikTok desde secrets
 DEFAULT_CLIENT_KEY = get_secret("tiktok", "client_key", "sbawgv6qorcmbtk9qx")
 DEFAULT_CLIENT_SECRET = get_secret("tiktok", "client_secret", "0rdY9yBOfMMkmTLLwjfxcPZvWOkyX9LJ")
 DEFAULT_ACCESS_TOKEN = get_secret("tiktok", "access_token", "act.cuwQeEcQPrfg91SURpGkVe2bhSRAZyyGKVbCPsai75zbKqWtjvQ6OqgiWdIh!5618.s1")
 DEFAULT_REFRESH_TOKEN = get_secret("tiktok", "refresh_token", "rft.z05jQNXtC24zqLNoBEAHsuMTpLSOBDbTKj1APHeTiwvVlcyUMngx6W9iSdnR!5635.s1")
 
-# Inicialización del estado de sesión para TikTok
+# Inicialización del estado de sesión de TikTok
 if "tiktok_access_token" not in st.session_state:
     st.session_state["tiktok_access_token"] = DEFAULT_ACCESS_TOKEN
 
@@ -68,12 +76,11 @@ def verify_telegram_bot_token(bot_token: str):
         return False, f"Error de conexión: {str(e)}", None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def verify_telegram_chat_id(bot_token: str, chat_id: str):
-    """Valida si el bot de Telegram tiene acceso al chat indicado."""
-    if not chat_id or not chat_id.strip():
+    """Valida si el bot de Telegram tiene acceso directo al chat del usuario."""
+    if not chat_id or not str(chat_id).strip():
         return False, "Chat ID no proporcionado"
-    clean_id = chat_id.strip()
+    clean_id = str(chat_id).strip()
     if not (clean_id.isdigit() or (clean_id.startswith("-") and clean_id[1:].isdigit())):
         return False, "El Chat ID debe ser numérico"
     if not bot_token:
@@ -190,12 +197,11 @@ def upload_video_to_tiktok(video_path: str):
 st.sidebar.title("🔑 Configuración")
 
 # --- 4.1. Gemini API Key ---
-default_gemini = get_secret("general", "gemini_api_key")
 gemini_key = st.sidebar.text_input(
     "Gemini API Key",
-    value=default_gemini,
+    value=DEFAULT_GEMINI_KEY,
     type="password",
-    help="Clave obtenida desde Google AI Studio"
+    help="Clave configurada en secrets o desde Google AI Studio"
 )
 
 if gemini_key:
@@ -210,12 +216,11 @@ else:
 st.sidebar.markdown("---")
 
 # --- 4.2. Telegram Bot Token & Chat ID ---
-default_tg_token = get_secret("telegram", "bot_token")
 telegram_token = st.sidebar.text_input(
     "Telegram Bot Token",
-    value=default_tg_token,
+    value=DEFAULT_TG_TOKEN,
     type="password",
-    help="Token de acceso proporcionado por @BotFather"
+    help="Token configurado en secrets o proporcionado por @BotFather"
 )
 
 bot_is_valid = False
@@ -227,11 +232,10 @@ if telegram_token:
     else:
         st.sidebar.error(f"❌ {tg_msg}")
 
-default_tg_chat = get_secret("telegram", "chat_id")
 telegram_chat_id = st.sidebar.text_input(
     "Telegram Chat ID",
-    value=default_tg_chat,
-    help="Tu ID numérico de Telegram (ej. 123456789 o -100123456789)"
+    value=DEFAULT_TG_CHAT,
+    help="ID numérico de Telegram (ej. 8870484184)"
 )
 
 if telegram_chat_id:
