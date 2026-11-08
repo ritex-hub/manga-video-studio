@@ -1,12 +1,15 @@
 import os
-import time
+import re
+import json
 import asyncio
+import urllib.parse
 import requests
+import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
-# Importaciones condicionales para procesamiento de video y voz
+# Dependencias multimedia
 try:
     import fitz  # PyMuPDF
 except ImportError:
@@ -18,15 +21,19 @@ except ImportError:
     edge_tts = None
 
 try:
-    from moviepy.editor import ImageClip, AudioFileClip
+    from moviepy.editor import (
+        ImageClip,
+        AudioFileClip,
+        CompositeAudioClip,
+        concatenate_videoclips,
+    )
 except ImportError:
     ImageClip = None
-    AudioFileClip = None
 
-st.set_page_config(page_title="Manga & Story Studio Pro", layout="wide", page_icon="🎬")
+st.set_page_config(page_title="Manga & Story Studio Autonomous", layout="wide", page_icon="🎬")
 
 # ==============================================================================
-# 1. GESTIÓN AUTOMÁTICA DE SECRETOS
+# 1. GESTIÓN AUTOMÁTICA DE CREDENCIALES
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
@@ -54,7 +61,7 @@ if "tiktok_refresh_token" not in st.session_state:
 
 
 # ==============================================================================
-# 2. VALIDACIONES DE CONEXIONES EN VIVO
+# 2. VALIDACIONES DE CONEXIONES
 # ==============================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -69,23 +76,23 @@ def verify_gemini_api_key(api_key: str):
         data = res.json()
         return False, data.get("error", {}).get("message", "Clave no válida")
     except Exception as e:
-        return False, f"Error de conexión: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def verify_hf_token(token: str):
     if not token or not token.startswith("hf_"):
-        return False, "Token con formato inválido (debe iniciar con hf_)"
+        return False, "Formato inválido (debe iniciar con hf_)"
     url = "https://huggingface.co/api/whoami-v2"
     headers = {"Authorization": f"Bearer {token.strip()}"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             user = res.json().get("name", "Usuario HF")
-            return True, f"Conectado a Hugging Face ({user})"
+            return True, f"Conectado a HF ({user})"
         return False, "Token inválido o sin permisos"
     except Exception as e:
-        return False, f"Error de conexión: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -101,7 +108,7 @@ def verify_telegram_bot_token(bot_token: str):
             return True, f"Conectado (@{bot_username})", bot_username
         return False, data.get("description", "Token inválido"), None
     except Exception as e:
-        return False, f"Error de conexión: {str(e)}", None
+        return False, f"Error: {str(e)}", None
 
 
 def verify_telegram_chat_id(bot_token: str, chat_id: str):
@@ -126,7 +133,7 @@ def verify_telegram_chat_id(bot_token: str, chat_id: str):
 
 def send_telegram_notification(bot_token: str, chat_id: str, message: str, video_path: str = None):
     if not bot_token or not chat_id:
-        return False, "Faltan credenciales de Telegram"
+        return False, "Faltan credenciales"
     try:
         if video_path and os.path.exists(video_path):
             url = f"https://api.telegram.org/bot{bot_token.strip()}/sendVideo"
@@ -144,62 +151,217 @@ def send_telegram_notification(bot_token: str, chat_id: str, message: str, video
 
 
 # ==============================================================================
-# 3. GENERACIÓN DE IMAGEN Y VOZ GRATIS (HF + EDGE-TTS)
+# 3. MOTOR MULTIMEDIA GRATUITO (TTS + SUBTÍTULOS + MÚSICA + FALLBACK VISUAL)
 # ==============================================================================
 
-def generate_image_hf(prompt: str, token: str, output_path: str):
-    """Genera una imagen con IA gratuita usando el endpoint de Hugging Face."""
-    # Usamos Stability AI SDXL base o FLUX-schnell
-    api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-    headers = {"Authorization": f"Bearer {token.strip()}"}
-    payload = {
-        "inputs": f"{prompt}, manhwa style, comic art, high action, cinematic lighting, 8k, vertical 9:16 composition",
-        "parameters": {"negative_prompt": "blurry, low quality, distorted, extra limbs, bad anatomy"}
-    }
-    
-    response = requests.post(api_url, headers=headers, json=payload, timeout=90)
-    if response.status_code == 200:
-        with open(output_path, "wb") as f:
-            f.write(response.content)
-        return True, output_path
-    else:
-        return False, f"Error HF ({response.status_code}): {response.text}"
+CHARACTER_ANCHOR = "Jun-woo, 24yo korean male soldier, short undercut black hair, left cybernetic glowing cyan eye, high collar black tactical jacket"
+
+def ensure_background_music():
+    """Descarga o prepara una pista de acción gratuita para mezclar de fondo."""
+    bgm_path = "/tmp/bgm_action.mp3" if os.name != "nt" else "bgm_action.mp3"
+    if not os.path.exists(bgm_path):
+        sample_url = "https://cdn.pixabay.com/download/audio/2022/05/16/audio_db6591201e.mp3?filename=cyberpunk-action-111863.mp3"
+        try:
+            r = requests.get(sample_url, timeout=15)
+            if r.status_code == 200:
+                with open(bgm_path, "wb") as f:
+                    f.write(r.content)
+            else:
+                bgm_path = None
+        except Exception:
+            bgm_path = None
+    return bgm_path
 
 
-async def generate_speech_edge(text: str, voice: str, output_path: str):
-    """Genera audio mp3 ultrarrealista sin coste con edge-tts."""
+async def synthesize_speech_with_subtitles(text: str, voice: str, audio_path: str):
+    """Genera audio MP3 y extrae los timestamps de cada palabra para los subtítulos."""
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+    subtitles = []
+    
+    with open(audio_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                subtitles.append({
+                    "word": chunk["text"],
+                    "start": chunk["offset"] / 10_000_000,
+                    "end": (chunk["offset"] + chunk["duration"]) / 10_000_000
+                })
+    return subtitles
 
 
-def create_vertical_video_clip(image_path: str, audio_path: str, output_video_path: str):
-    """Combina la imagen 9:16 con el audio y genera el clip MP4 final."""
+def generate_image_with_fallback(prompt: str, hf_token: str, output_path: str, seed: int = 42):
+    """Genera la imagen en Hugging Face; si está ocupado, conmuta a Pollinations sin frenar la app."""
+    full_prompt = f"{CHARACTER_ANCHOR}, {prompt}, manhwa action style, vibrant neon colors, detailed comic book line art, vertical 9:16 composition"
+    
+    # 1. Intentar con Hugging Face (SDXL)
+    if hf_token:
+        try:
+            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
+            payload = {
+                "inputs": full_prompt,
+                "parameters": {"seed": seed, "negative_prompt": "blurry, low quality, distorted, extra limbs, bad anatomy"}
+            }
+            res = requests.post(api_url, headers=headers, json=payload, timeout=40)
+            if res.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(res.content)
+                return True, "Hugging Face (SDXL)"
+        except Exception:
+            pass
+
+    # 2. Respaldo transparente e inmediato con Pollinations.ai (100% gratuito)
+    try:
+        encoded_prompt = urllib.parse.quote(full_prompt)
+        poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&seed={seed}&nologo=true&model=flux"
+        r_poll = requests.get(poll_url, timeout=40)
+        if r_poll.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(r_poll.content)
+            return True, "Pollinations AI (Flux Gratis)"
+        return False, "Fallo en ambos proveedores visuales"
+    except Exception as ex:
+        return False, str(ex)
+
+
+def overlay_subtitles_on_frame(pil_img, current_text):
+    """Dibuja subtítulos estilo TikTok (amarillo con trazo negro grueso centrado)."""
+    if not current_text:
+        return pil_img
+    draw = ImageDraw.Draw(pil_img)
+    w, h = pil_img.size
+    
+    # Fallback a fuente básica
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 60)
+    except Exception:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), current_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    
+    x = (w - text_w) // 2
+    y = int(h * 0.75)  # En el tercio inferior para retención TikTok
+
+    # Borde negro
+    stroke_w = 4
+    for dx in range(-stroke_w, stroke_w + 1):
+        for dy in range(-stroke_w, stroke_w + 1):
+            draw.text((x + dx, y + dy), current_text, font=font, fill=(0, 0, 0))
+
+    # Texto en amarillo brillante
+    draw.text((x, y), current_text, font=font, fill=(255, 235, 59))
+    return pil_img
+
+
+def build_final_video_with_audio_and_subs(image_path: str, audio_path: str, subtitles: list, output_video_path: str):
+    """Ensambla el clip 9:16 con efecto zoom, subtítulos dinámicos y mezcla de música."""
     target_w, target_h = 1080, 1920
-    img = Image.open(image_path).convert("RGB")
-    w, h = img.size
+    base_img = Image.open(image_path).convert("RGB")
+    w, h = base_img.size
     
     scale = max(target_w / w, target_h / h)
     nw, nh = int(w * scale), int(h * scale)
-    img_resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    resized_img = base_img.resize((nw, nh), Image.Resampling.LANCZOS)
     
-    # Centrar recorte vertical
     left = (nw - target_w) // 2
     top = (nh - target_h) // 2
-    img_cropped = img_resized.crop((left, top, left + target_w, top + target_h))
-    
-    audio_clip = AudioFileClip(audio_path)
-    duration = audio_clip.duration + 0.5
-    
-    # Crear clip con movimiento sutil (zoom in)
-    clip = ImageClip(np.array(img_cropped)).set_duration(duration)
-    video = clip.set_audio(audio_clip)
-    video.write_videofile(output_video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
-    audio_clip.close()
+    cropped_img = resized_img.crop((left, top, left + target_w, top + target_h))
+
+    # Cargar audio de voz
+    voice_clip = AudioFileClip(audio_path)
+    total_duration = voice_clip.duration + 0.4
+
+    # Generación de frames con zoom suave y subtítulos
+    def frame_generator(t):
+        # Zoom sutil: 1.0 a 1.05
+        zoom_factor = 1.0 + 0.05 * (t / max(total_duration, 1))
+        zw, zh = int(target_w * zoom_factor), int(target_h * zoom_factor)
+        z_img = cropped_img.resize((zw, zh), Image.Resampling.BILINEAR)
+        
+        cx, cy = (zw - target_w) // 2, (zh - target_h) // 2
+        f_img = z_img.crop((cx, cy, cx + target_w, cy + target_h))
+        
+        # Encontrar palabra activa
+        current_words = []
+        for s in subtitles:
+            if s["start"] <= t <= s["end"] + 0.15:
+                current_words.append(s["word"])
+        
+        active_str = " ".join(current_words).upper()
+        f_img = overlay_subtitles_on_frame(f_img, active_str)
+        return np.array(f_img)
+
+    video_clip = ImageClip(np.array(cropped_img)).set_duration(total_duration)
+    video_with_fx = video_clip.fl(lambda gf, t: frame_generator(t))
+
+    # Mezcla de audio con fondo musical
+    bgm_path = ensure_background_music()
+    if bgm_path and os.path.exists(bgm_path):
+        try:
+            bgm = AudioFileClip(bgm_path).volumex(0.12)
+            if bgm.duration < total_duration:
+                bgm = bgm.loop(duration=total_duration)
+            else:
+                bgm = bgm.subclip(0, total_duration)
+            final_audio = CompositeAudioClip([voice_clip.volumex(1.0), bgm])
+        except Exception:
+            final_audio = voice_clip
+    else:
+        final_audio = voice_clip
+
+    video_final = video_with_fx.set_audio(final_audio)
+    video_final.write_videofile(output_video_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    voice_clip.close()
     return output_video_path
 
 
 # ==============================================================================
-# 4. TIKTOK CONTENT POSTING API V2
+# 4. SEGMENTACIÓN DE VIÑETAS CON OPENCV (MANGA / MANHWA PDF)
+# ==============================================================================
+
+def detect_and_crop_panels(image_path: str):
+    """Detecta las viñetas rectangulares con OpenCV y las ordena verticalmente."""
+    cv_img = cv2.imread(image_path)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    
+    # Detección de bordes mediante umbral adaptable
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 5)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    panels = []
+    img_h, img_w = gray.shape
+    min_area = (img_w * img_h) * 0.05  # Viñetas que ocupen al menos 5% de la página
+    
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if (w * h) > min_area and w > 200 and h > 150:
+            panels.append((x, y, w, h))
+            
+    # Ordenar de arriba a abajo (lectura webtoon/manhwa)
+    panels.sort(key=lambda b: b[1])
+    
+    cropped_paths = []
+    pil_src = Image.open(image_path)
+    
+    for idx, (x, y, w, h) in enumerate(panels):
+        # Margen de seguridad de 5 píxeles
+        x1, y1 = max(0, x - 5), max(0, y - 5)
+        x2, y2 = min(img_w, x + w + 5), min(img_h, y + h + 5)
+        crop_p = pil_src.crop((x1, y1, x2, y2))
+        
+        c_path = f"/tmp/panel_{idx}.png" if os.name != "nt" else f"panel_{idx}.png"
+        crop_p.save(c_path)
+        cropped_paths.append(c_path)
+        
+    return cropped_paths
+
+
+# ==============================================================================
+# 5. TIKTOK CONTENT POSTING V2
 # ==============================================================================
 
 def renew_tiktok_token():
@@ -226,7 +388,7 @@ def renew_tiktok_token():
 
 def upload_video_to_tiktok(video_path: str):
     if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Archivo inexistente: {video_path}")
+        raise FileNotFoundError(f"Video no encontrado: {video_path}")
 
     file_size = os.path.getsize(video_path)
     access_token = st.session_state["tiktok_access_token"]
@@ -258,7 +420,7 @@ def upload_video_to_tiktok(video_path: str):
         init_data = res_init.json()
 
     if init_data.get("error", {}).get("code") != "ok":
-        raise Exception(f"Fallo en TikTok API: {init_data}")
+        raise Exception(f"Fallo TikTok API: {init_data}")
 
     upload_url = init_data["data"]["upload_url"]
     publish_id = init_data["data"]["publish_id"]
@@ -278,12 +440,12 @@ def upload_video_to_tiktok(video_path: str):
 
 
 # ==============================================================================
-# 5. BARRA LATERAL (CONFIGURACIÓN)
+# 6. INTERFAZ Y BARRA LATERAL
 # ==============================================================================
 
-st.sidebar.title("🔑 Configuración")
+st.sidebar.title("⚡ Panel de Conexiones")
 
-# 1. Gemini
+# Gemini
 gemini_key = st.sidebar.text_input("Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
 if gemini_key:
     ok_gem, msg_gem = verify_gemini_api_key(gemini_key)
@@ -291,11 +453,9 @@ if gemini_key:
         st.sidebar.success(f"✅ {msg_gem}")
     else:
         st.sidebar.error(f"❌ {msg_gem}")
-else:
-    st.sidebar.info("ℹ️ Ingresa tu clave de Gemini")
 
-# 2. Hugging Face
-hf_token = st.sidebar.text_input("Hugging Face Token", value=DEFAULT_HF_TOKEN, type="password", help="Para generar imágenes gratis")
+# Hugging Face
+hf_token = st.sidebar.text_input("Hugging Face Token", value=DEFAULT_HF_TOKEN, type="password")
 hf_is_valid = False
 if hf_token:
     ok_hf, msg_hf = verify_hf_token(hf_token)
@@ -304,12 +464,10 @@ if hf_token:
         hf_is_valid = True
     else:
         st.sidebar.error(f"❌ {msg_hf}")
-else:
-    st.sidebar.info("ℹ️ Agrega tu Token de Hugging Face")
 
 st.sidebar.markdown("---")
 
-# 3. Telegram
+# Telegram
 telegram_token = st.sidebar.text_input("Telegram Bot Token", value=DEFAULT_TG_TOKEN, type="password")
 bot_is_valid = False
 if telegram_token:
@@ -317,196 +475,169 @@ if telegram_token:
     if ok_tg:
         st.sidebar.success(f"✅ {msg_tg}")
         bot_is_valid = True
-    else:
-        st.sidebar.error(f"❌ {msg_tg}")
 
 telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=DEFAULT_TG_CHAT)
 chat_is_valid = False
-if telegram_chat_id:
-    if bot_is_valid:
-        ok_chat, msg_chat = verify_telegram_chat_id(telegram_token, telegram_chat_id)
-        if ok_chat:
-            st.sidebar.success(f"✅ {msg_chat}")
-            chat_is_valid = True
-        else:
-            st.sidebar.error(f"❌ {msg_chat}")
-    else:
-        st.sidebar.warning("⚠️ Primero ingresa un Bot Token válido")
+if telegram_chat_id and bot_is_valid:
+    ok_chat, msg_chat = verify_telegram_chat_id(telegram_token, telegram_chat_id)
+    if ok_chat:
+        st.sidebar.success(f"✅ {msg_chat}")
+        chat_is_valid = True
 
 st.sidebar.markdown("---")
 
-# 4. TikTok
-st.sidebar.subheader("🎵 Estado de TikTok")
+# TikTok Status
+st.sidebar.subheader("🎵 TikTok Status")
 if st.session_state["tiktok_access_token"]:
-    st.sidebar.success("✅ Conectado a TikTok")
-    if st.sidebar.button("🔄 Refrescar Token"):
-        new_tok = renew_tiktok_token()
-        if new_tok:
-            st.sidebar.info("Token renovado con éxito")
-else:
-    st.sidebar.warning("⚠️ Sin token activo")
+    st.sidebar.success("✅ Token Activo (Sandbox)")
+    if st.sidebar.button("🔄 Renovar Token"):
+        if renew_tiktok_token():
+            st.sidebar.info("Renovado")
 
 
 # ==============================================================================
-# 6. PESTAÑAS PRINCIPALES DE TRABAJO
+# 7. WORKFLOWS PRINCIPALES
 # ==============================================================================
 
-st.title("🎬 Manga & Story Studio: Generación y Publicación Autónoma")
+st.title("🎬 Manga Studio: Pipeline Autónomo")
 
 tabs = st.tabs([
-    "🤖 1. Productor IA Autónomo (Guion + Voz + Imagen)", 
-    "📖 2. Animador de Manga (PDF)", 
-    "🚀 3. TikTok Uploader Directo"
+    "🚀 1. Productor Total Autónomo (IA + Voz + Subs + BGM)", 
+    "📑 2. Segmentador Inteligente de Viñetas (OpenCV)", 
+    "📤 3. TikTok Direct Publisher"
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: Flujo Autónomo Completo
+# PESTAÑA 1: Pipeline Autónomo Completo
 # ------------------------------------------------------------------------------
 with tabs[0]:
-    st.subheader("Generador Autónomo de Video para TikTok")
+    st.subheader("Generación Automática de Video Completo")
     story_theme = st.text_area(
-        "Idea Central o Sinopsis:",
-        value="Jun-woo, un exsoldado en el Seúl ciberpunk, descubre una lista de objetivos encubiertos y escapa por los techos bajo la lluvia.",
+        "Idea Central:",
+        value="Jun-woo corre sobre los techos mojados de Seúl mientras drones de combate abren fuego a sus espaldas.",
         height=80
     )
     
-    c_voice, c_btn = st.columns([2, 2])
+    c_voice, c_seed = st.columns([2, 1])
     with c_voice:
         selected_voice = st.selectbox(
-            "Voz de Narración (Gratis con Edge-TTS):",
-            ["es-MX-JorgeNeural (Hombre - Suspenso/Acción)", "es-ES-AlvaroNeural (Hombre - Narrador)", "es-MX-DaliaNeural (Mujer - Rápido)", "es-ES-ElviraNeural (Mujer - Dramático)"]
+            "Voz de Narración:",
+            ["es-MX-JorgeNeural (Acción/Suspenso)", "es-ES-AlvaroNeural (Narrador Épico)", "es-MX-DaliaNeural (Enérgica)"]
         )
         voice_id = selected_voice.split(" ")[0]
+    with c_seed:
+        char_seed = st.number_input("Seed de Consistencia", value=42)
 
-    if st.button("⚡ Crear Capítulo Completo (Guion + Imagen IA + Voz + Video 9:16)", type="primary"):
+    if st.button("🔥 Generar Video Completo (Guion + Visual + Voz + Subs + BGM)", type="primary"):
         if not gemini_key:
-            st.error("Se requiere la clave de Gemini en la barra lateral.")
-        elif not hf_is_valid:
-            st.error("Se requiere un Token válido de Hugging Face para generar la imagen gratis.")
+            st.error("Requiere API Key de Gemini.")
         else:
-            with st.status("Procesando creación multimedia...", expanded=True) as status:
-                # 1. Gemini: Generar narración y prompt visual
-                st.write("🧠 1. Gemini diseñando guion y prompt fotográfico...")
-                prompt_ai = f"""
-                Eres director de micro-historias de manga/webtoon para TikTok.
-                Basado en esta idea: '{story_theme}'
-                Devuelve EXACTAMENTE dos líneas:
-                NARRACION: (Texto en español impactante para narrar en 10-12 segundos).
-                PROMPT: (Prompt en inglés muy detallado para generar una imagen estilo webtoon manhwa vertical de acción).
+            with st.status("Ejecutando pipeline de producción...", expanded=True) as status:
+                # 1. Gemini: Prompt y Narración
+                st.write("🧠 1. Redactando guion y prompt coherente...")
+                p_text = f"""
+                Eres director de videos cortos para TikTok de acción. Premisa: '{story_theme}'
+                Devuelve exactamente:
+                NARRACION: (Una frase en español corta y de alto impacto para narrar en 7-9 segundos).
+                PROMPT: (Prompt visual en inglés describiendo la acción exacta con estilo manhwa cyberpunk).
                 """
-                url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
-                res_gem = requests.post(url_gem, headers={"Content-Type": "application/json"}, json={"contents": [{"parts": [{"text": prompt_ai}]}]}, timeout=30)
-                gem_text = res_gem.json()["candidates"][0]["content"]["parts"][0]["text"]
+                url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
+                res_g = requests.post(url_g, headers={"Content-Type": "application/json"}, json={"contents": [{"parts": [{"text": p_text}]}]}, timeout=30)
+                txt_resp = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
                 
-                narracion = "En las sombras de la ciudad, el protocolo cero ha comenzado."
-                img_prompt = "Cyberpunk soldier jumping between neon skyscrapers in rain, manhwa artstyle"
-                for line in gem_text.split("\n"):
-                    if line.startswith("NARRACION:"):
-                        narracion = line.replace("NARRACION:", "").strip()
-                    elif line.startswith("PROMPT:"):
-                        img_prompt = line.replace("PROMPT:", "").strip()
+                narracion = "El protocolo cero ha comenzado. Ya no hay vuelta atrás."
+                img_prompt = "running across wet rooftops, dodging laser fire from gunships"
+                for l in txt_resp.split("\n"):
+                    if l.startswith("NARRACION:"):
+                        narracion = l.replace("NARRACION:", "").strip()
+                    elif l.startswith("PROMPT:"):
+                        img_prompt = l.replace("PROMPT:", "").strip()
 
-                st.info(f"🎙️ **Narración:** {narracion}")
-                st.info(f"🎨 **Prompt Visual:** {img_prompt}")
+                st.info(f"🎙️ **Voz:** {narracion}")
 
-                # 2. Generar Voz Gratis con Edge-TTS
-                st.write("🗣️ 2. Sintetizando voz en off realista con Edge-TTS...")
-                temp_audio = "/tmp/story_voice.mp3" if os.name != "nt" else "story_voice.mp3"
-                asyncio.run(generate_speech_edge(narracion, voice_id, temp_audio))
+                # 2. Voz + Subtítulos con Edge-TTS
+                st.write("🗣️ 2. Sintetizando voz y extrayendo timestamps para subtítulos...")
+                temp_aud = "/tmp/voice.mp3" if os.name != "nt" else "voice.mp3"
+                subtitles = asyncio.run(synthesize_speech_with_subtitles(narracion, voice_id, temp_aud))
 
-                # 3. Generar Imagen Gratis con Hugging Face
-                st.write("🖼️ 3. Generando arte manhwa con Hugging Face (SDXL)...")
-                temp_img = "/tmp/story_img.png" if os.name != "nt" else "story_img.png"
-                ok_img, msg_img = generate_image_hf(img_prompt, hf_token, temp_img)
+                # 3. Imagen con Fallback
+                st.write("🎨 3. Generando arte con consistencia de personaje...")
+                temp_img = "/tmp/scene.png" if os.name != "nt" else "scene.png"
+                ok_img, prov = generate_image_with_fallback(img_prompt, hf_token, temp_img, seed=char_seed)
+                st.caption(f"Proveedor visual: {prov}")
+
+                # 4. Render Final con Subs y BGM
+                st.write("🎬 4. Ensamblando video vertical 9:16 con subtítulos dinámicos y música...")
+                final_out = "/tmp/tiktok_master.mp4" if os.name != "nt" else "tiktok_master.mp4"
+                build_final_video_with_audio_and_subs(temp_img, temp_aud, subtitles, final_out)
+
+                st.session_state["latest_video_path"] = final_out
+                status.update(label="¡Video terminado y listo!", state="complete")
                 
-                if not ok_img:
-                    st.error(f"Fallo al generar imagen: {msg_img}")
-                    status.update(label="Error en generación visual", state="error")
-                else:
-                    # 4. Ensamblar Video 9:16 con MoviePy
-                    st.write("🎬 4. Renderizando video vertical 9:16 con audio sincronizado...")
-                    final_video = "/tmp/tiktok_ready.mp4" if os.name != "nt" else "tiktok_ready.mp4"
-                    create_vertical_video_clip(temp_img, temp_audio, final_video)
-                    
-                    st.session_state["latest_video_path"] = final_video
-                    status.update(label="¡Video generado exitosamente!", state="complete")
-                    
-                    st.success("🎉 Video producido de principio a fin:")
-                    st.video(final_video)
-                    
-                    c_up1, c_up2 = st.columns(2)
-                    with c_up1:
-                        if st.button("📤 Publicar Directo en Borradores de TikTok"):
-                            pid = upload_video_to_tiktok(final_video)
-                            st.success(f"¡Subido a TikTok! Publish ID: `{pid}`")
-                            if chat_is_valid:
-                                send_telegram_notification(telegram_token, telegram_chat_id, f"✅ Video subido a TikTok.\nPublish ID: {pid}", final_video)
-                    with c_up2:
-                        if chat_is_valid and st.button("📲 Enviar Vista Previa a Telegram"):
-                            send_telegram_notification(telegram_token, telegram_chat_id, f"🎬 Previsualización de escena:\n\n{narracion}", final_video)
-                            st.success("Enviado a tu Telegram.")
+                st.success("🎉 Video ensamblado con subtítulos dinámicos y mezcla de audio:")
+                st.video(final_out)
+                
+                col_u1, col_u2 = st.columns(2)
+                with col_u1:
+                    if st.button("📤 Enviar a Borradores de TikTok"):
+                        pid = upload_video_to_tiktok(final_out)
+                        st.success(f"¡Publicado en borrador! ID: `{pid}`")
+                        if chat_is_valid:
+                            send_telegram_notification(telegram_token, telegram_chat_id, f"✅ Video publicado en TikTok: {pid}", final_out)
+                with col_u2:
+                    if chat_is_valid and st.button("📲 Recibir Video por Telegram"):
+                        send_telegram_notification(telegram_token, telegram_chat_id, f"🎬 Copia de respaldo:\n\n{narracion}", final_out)
+                        st.success("Enviado a tu Telegram.")
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 2: Animación de Manga PDF
+# PESTAÑA 2: Segmentador OpenCV para PDF
 # ------------------------------------------------------------------------------
 with tabs[1]:
-    st.subheader("Animación Dinámica de Viñetas desde PDF")
-    pdf_file = st.file_uploader("Sube el PDF del Manga o Manhwa", type=["pdf"])
-    if pdf_file and fitz:
-        page_num = st.number_input("Página a animar", min_value=1, value=1)
-        dur = st.slider("Duración (segundos)", 3, 12, 6)
-        if st.button("Animar Página"):
-            doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-            if page_num <= len(doc):
-                pix = doc[page_num - 1].get_pixmap(dpi=200)
-                temp_p = f"/tmp/p_{page_num}.png" if os.name != "nt" else f"p_{page_num}.png"
-                pix.save(temp_p)
-                
-                # Barrido vertical continuo
-                pil_i = Image.open(temp_p).convert("RGB")
-                target_w, target_h = 1080, 1920
-                scale = target_w / float(pil_i.size[0])
-                nh = int(pil_i.size[1] * scale)
-                pil_res = pil_i.resize((target_w, nh), Image.Resampling.LANCZOS)
-                
-                out_p = f"/tmp/manga_scroll_{page_num}.mp4" if os.name != "nt" else f"manga_scroll_{page_num}.mp4"
-                if nh > target_h:
-                    max_scroll = nh - target_h
-                    clip = ImageClip(np.array(pil_res.crop((0, 0, target_w, target_h)))).set_duration(dur)
-                    vid = clip.fl(lambda gf, t: np.array(pil_res.crop((0, int((t/dur)*max_scroll), target_w, int((t/dur)*max_scroll)+target_h))))
-                else:
-                    bg = Image.new("RGB", (target_w, target_h), (0, 0, 0))
-                    bg.paste(pil_res, (0, (target_h - nh)//2))
-                    vid = ImageClip(np.array(bg)).set_duration(dur)
+    st.subheader("Segmentación y Recorte Automático de Viñetas")
+    pdf_input = st.file_uploader("Sube el PDF de Manga o Manhwa", type=["pdf"])
+    
+    if pdf_input and fitz:
+        p_num = st.number_input("Página a segmentar", min_value=1, value=1)
+        if st.button("🔍 Detectar y Cortar Viñetas con OpenCV"):
+            with st.spinner("Procesando bordes y recortando recuadros individuales..."):
+                doc = fitz.open(stream=pdf_input.read(), filetype="pdf")
+                if p_num <= len(doc):
+                    page = doc[p_num - 1]
+                    pix = page.get_pixmap(dpi=200)
+                    t_page = f"/tmp/doc_p{p_num}.png" if os.name != "nt" else f"doc_p{p_num}.png"
+                    pix.save(t_page)
                     
-                vid.write_videofile(out_p, fps=24, codec="libx264", audio=False, verbose=False, logger=None)
-                st.session_state["latest_video_path"] = out_p
-                st.video(out_p)
+                    panel_files = detect_and_crop_panels(t_page)
+                    if panel_files:
+                        st.success(f"¡Se detectaron y recortaron {len(panel_files)} viñetas independientes!")
+                        cols = st.columns(min(len(panel_files), 4))
+                        for idx, p_path in enumerate(panel_files):
+                            cols[idx % 4].image(p_path, caption=f"Viñeta {idx+1}")
+                    else:
+                        st.warning("No se detectaron viñetas cerradas con bordes gruesos. La página puede ser continua.")
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 3: Subida Manual a TikTok
+# PESTAÑA 3: Publicador Directo
 # ------------------------------------------------------------------------------
 with tabs[2]:
-    st.subheader("Subida Directa a TikTok (Borradores)")
-    manual_vid = st.file_uploader("Selecciona archivo MP4", type=["mp4"])
+    st.subheader("Subida Manual de Videos MP4 a TikTok")
+    uploaded_manual = st.file_uploader("Archivo MP4:", type=["mp4"])
     
-    path_to_send = None
-    if manual_vid:
-        temp_man = f"/tmp/{manual_vid.name}" if os.name != "nt" else manual_vid.name
-        with open(temp_man, "wb") as f:
-            f.write(manual_vid.read())
-        path_to_send = temp_man
-        st.video(path_to_send)
+    target_send = None
+    if uploaded_manual:
+        t_man = f"/tmp/{uploaded_manual.name}" if os.name != "nt" else uploaded_manual.name
+        with open(t_man, "wb") as f:
+            f.write(uploaded_manual.read())
+        target_send = t_man
+        st.video(target_send)
     elif "latest_video_path" in st.session_state and os.path.exists(st.session_state["latest_video_path"]):
-        st.info("Usando video creado en las pestañas anteriores:")
-        path_to_send = st.session_state["latest_video_path"]
-        st.video(path_to_send)
+        st.info("Usando video creado recientemente:")
+        target_send = st.session_state["latest_video_path"]
+        st.video(target_send)
 
-    if path_to_send and st.button("Subir ahora a TikTok"):
+    if target_send and st.button("Publicar en TikTok Inbox"):
         try:
-            pub_id = upload_video_to_tiktok(path_to_send)
-            st.success(f"¡Publicado en borrador con éxito! ID: `{pub_id}`")
-            if chat_is_valid:
-                send_telegram_notification(telegram_token, telegram_chat_id, f"Video enviado a TikTok: {pub_id}")
+            pub_id = upload_video_to_tiktok(target_send)
+            st.success(f"Publicado con éxito. Publish ID: `{pub_id}`")
         except Exception as e:
             st.error(f"Error al subir: {str(e)}")
