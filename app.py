@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import base64
 import asyncio
 import urllib.parse
 import requests
@@ -22,23 +24,25 @@ except ImportError:
 
 try:
     from moviepy.editor import (
+        VideoFileClip,
         ImageClip,
         AudioFileClip,
         CompositeAudioClip,
     )
 except ImportError:
+    VideoFileClip = None
     ImageClip = None
 
-# Supabase Client
+# Supabase
 try:
     from supabase import create_client, Client
 except ImportError:
     create_client = None
 
-st.set_page_config(page_title="Manga Studio Autonomous Pro", layout="wide", page_icon="🎬")
+st.set_page_config(page_title="Manga & Motion Studio Pro", layout="wide", page_icon="🎬")
 
 # ==============================================================================
-# 1. GESTIÓN AUTOMÁTICA DE SECRETOS Y SERVICIOS
+# 1. GESTIÓN AUTOMÁTICA DE SECRETOS
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
@@ -50,11 +54,13 @@ def get_secret(section: str, key: str, default: str = "") -> str:
 
 DEFAULT_GEMINI_KEY = get_secret("gemini", "api_key", get_secret("general", "gemini_api_key"))
 DEFAULT_HF_TOKEN = get_secret("huggingface", "api_token")
+DEFAULT_KLING_KEY = get_secret("kling", "api_key", "api-key-kling-otaEHG1Oc3dbVlCl4IWWvPdRlmW88EQ_qq_n1Lvuw1U")
+
+DEFAULT_SB_URL = get_secret("supabase", "url", "https://xfarkrxclnhibjvbrpxt.supabase.co")
+DEFAULT_SB_KEY = get_secret("supabase", "key", "sb_publishable_i3Sn59uhvXjPiA7XmzWCEg_VkR-deY1")
+
 DEFAULT_TG_TOKEN = get_secret("telegram", "bot_token")
 DEFAULT_TG_CHAT = get_secret("telegram", "chat_id")
-
-DEFAULT_SB_URL = get_secret("supabase", "url")
-DEFAULT_SB_KEY = get_secret("supabase", "key")
 
 DEFAULT_CLIENT_KEY = get_secret("tiktok", "client_key", "sbawgv6qorcmbtk9qx")
 DEFAULT_CLIENT_SECRET = get_secret("tiktok", "client_secret", "0rdY9yBOfMMkmTLLwjfxcPZvWOkyX9LJ")
@@ -77,7 +83,7 @@ if create_client and DEFAULT_SB_URL and DEFAULT_SB_KEY:
 
 
 # ==============================================================================
-# 2. VALIDACIONES Y TELEGRAM CON INLINE KEYBOARDS
+# 2. VALIDACIONES Y TELEGRAM
 # ==============================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -93,7 +99,6 @@ def verify_gemini_api_key(api_key: str):
 
 
 def send_telegram_with_approval(bot_token: str, chat_id: str, message: str, video_path: str = None, episode_id: int = 0):
-    """Envía el video a Telegram con botones interactivos de aprobación rápida."""
     if not bot_token or not chat_id:
         return False, "Faltan credenciales"
     
@@ -123,32 +128,11 @@ def send_telegram_with_approval(bot_token: str, chat_id: str, message: str, vide
         return False, str(ex)
 
 
-def check_telegram_approvals(bot_token: str):
-    """Revisa si el usuario pulsó el botón 'Publicar en TikTok' desde su chat de Telegram."""
-    if not bot_token:
-        return None
-    url = f"https://api.telegram.org/bot{bot_token.strip()}/getUpdates?offset=-5"
-    try:
-        res = requests.get(url, timeout=5)
-        data = res.json()
-        if data.get("ok"):
-            for update in reversed(data.get("result", [])):
-                if "callback_query" in update:
-                    cb_data = update["callback_query"].get("data", "")
-                    if cb_data.startswith("publish_"):
-                        ep_id = cb_data.split("_")[1]
-                        return ep_id
-    except Exception:
-        pass
-    return None
-
-
 # ==============================================================================
-# 3. SUPABASE (GESTIÓN DEL ESTADO Y EPISODIOS)
+# 3. SUPABASE (GESTIÓN DEL ESTADO)
 # ==============================================================================
 
 def get_current_episode_number():
-    """Determina automáticamente qué capítulo toca generar."""
     if not supabase:
         return 1
     try:
@@ -184,13 +168,12 @@ def save_episode_to_supabase(chapter_num, title, desc, tags, prompt, narr):
 
 
 # ==============================================================================
-# 4. MOTOR MULTIMEDIA (AUDIO, SFX, SUBS Y VISUAL)
+# 4. MOTOR MULTIMEDIA (KLING AI + IMAGE + TTS + SFX + SUBS)
 # ==============================================================================
 
 CHARACTER_ANCHOR = "Jun-woo, 24yo korean male soldier, short undercut black hair, left cybernetic glowing cyan eye, high collar black tactical jacket"
 
 def get_action_sfx():
-    """Descarga o localiza un sonido de impacto/arma para el hook inicial."""
     sfx_path = "/tmp/action_sfx.mp3" if os.name != "nt" else "action_sfx.mp3"
     if not os.path.exists(sfx_path):
         sample_url = "https://cdn.pixabay.com/download/audio/2021/08/04/audio_12b0c7443c.mp3?filename=hit-impact-metal-85341.mp3"
@@ -222,25 +205,26 @@ async def synthesize_speech_with_subtitles(text: str, voice: str, audio_path: st
     return subtitles
 
 
-def generate_image_with_fallback(prompt: str, hf_token: str, output_path: str, seed: int = 42):
+def generate_image_base(prompt: str, hf_token: str, output_path: str, seed: int = 42):
     full_prompt = f"{CHARACTER_ANCHOR}, {prompt}, manhwa action style, vibrant neon colors, detailed comic book line art, vertical 9:16 composition"
+    
     if hf_token:
         try:
             api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
             headers = {"Authorization": f"Bearer {hf_token.strip()}"}
             payload = {
                 "inputs": full_prompt,
-                "parameters": {"seed": seed, "negative_prompt": "blurry, low quality, distorted, extra limbs, bad anatomy"}
+                "parameters": {"seed": seed, "negative_prompt": "blurry, low quality, distorted, bad anatomy"}
             }
             res = requests.post(api_url, headers=headers, json=payload, timeout=40)
             if res.status_code == 200:
                 with open(output_path, "wb") as f:
                     f.write(res.content)
-                return True, "Hugging Face (SDXL)"
+                return True, "Hugging Face"
         except Exception:
             pass
 
-    # Respaldo inmediato gratuito con Pollinations AI
+    # Fallback inmediato con Pollinations AI
     try:
         encoded_prompt = urllib.parse.quote(full_prompt)
         poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&seed={seed}&nologo=true&model=flux"
@@ -248,10 +232,65 @@ def generate_image_with_fallback(prompt: str, hf_token: str, output_path: str, s
         if r_poll.status_code == 200:
             with open(output_path, "wb") as f:
                 f.write(r_poll.content)
-            return True, "Pollinations AI (Flux Gratis)"
-        return False, "Fallo en proveedores de imagen"
+            return True, "Pollinations AI (Flux)"
+        return False, "Fallo en generación visual"
     except Exception as ex:
         return False, str(ex)
+
+
+def generate_video_with_kling(image_path: str, prompt_text: str, output_video_path: str, duration: str = "5"):
+    """Llama a la API oficial de Kling AI para generar video vertical 9:16 con movimiento real."""
+    if not DEFAULT_KLING_KEY:
+        return False, "Falta la API Key de Kling."
+
+    endpoint = "https://api-singapore.klingai.com/v1/videos/image2video"
+    headers = {
+        "Authorization": f"Bearer {DEFAULT_KLING_KEY.strip()}",
+        "Content-Type": "application/json"
+    }
+
+    with open(image_path, "rb") as f:
+        b64_img = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "model_name": "kling-v1",
+        "image": b64_img,
+        "prompt": f"{prompt_text}, dynamic combat motion, cinematic camera movement, 4k",
+        "cfg_scale": 0.5,
+        "mode": "std",
+        "duration": duration,
+        "aspect_ratio": "9:16"
+    }
+
+    try:
+        res = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+        data = res.json()
+        if data.get("code") != 0:
+            return False, f"Kling error: {data.get('message')}"
+        task_id = data["data"]["task_id"]
+    except Exception as e:
+        return False, f"Error iniciando Kling: {e}"
+
+    status_url = f"https://api-singapore.klingai.com/v1/videos/image2video/{task_id}"
+    for _ in range(60):
+        time.sleep(3)
+        try:
+            r_stat = requests.get(status_url, headers=headers, timeout=20)
+            stat_data = r_stat.json()
+            task_status = stat_data.get("data", {}).get("task_status")
+
+            if task_status == "succeed":
+                video_url = stat_data["data"]["task_result"]["videos"][0]["url"]
+                r_vid = requests.get(video_url, timeout=60)
+                with open(output_video_path, "wb") as f:
+                    f.write(r_vid.content)
+                return True, output_video_path
+            elif task_status == "failed":
+                return False, f"Kling falló: {stat_data.get('data', {}).get('task_status_msg')}"
+        except Exception:
+            continue
+
+    return False, "Tiempo de espera agotado en Kling."
 
 
 def overlay_subtitles_on_frame(pil_img, current_text):
@@ -277,37 +316,52 @@ def overlay_subtitles_on_frame(pil_img, current_text):
     return pil_img
 
 
-def build_final_video_with_audio_and_sfx(image_path: str, audio_path: str, subtitles: list, output_video_path: str):
-    target_w, target_h = 1080, 1920
-    base_img = Image.open(image_path).convert("RGB")
-    w, h = base_img.size
-    
-    scale = max(target_w / w, target_h / h)
-    nw, nh = int(w * scale), int(h * scale)
-    resized_img = base_img.resize((nw, nh), Image.Resampling.LANCZOS)
-    
-    left = (nw - target_w) // 2
-    top = (nh - target_h) // 2
-    cropped_img = resized_img.crop((left, top, left + target_w, top + target_h))
-
+def build_final_video_with_audio_and_sfx(visual_path: str, audio_path: str, subtitles: list, output_video_path: str, is_motion_video: bool = False):
     voice_clip = AudioFileClip(audio_path)
-    total_duration = voice_clip.duration + 0.5
+    total_duration = voice_clip.duration + 0.4
 
-    def frame_generator(t):
-        zoom_factor = 1.0 + 0.05 * (t / max(total_duration, 1))
-        zw, zh = int(target_w * zoom_factor), int(target_h * zoom_factor)
-        z_img = cropped_img.resize((zw, zh), Image.Resampling.BILINEAR)
-        cx, cy = (zw - target_w) // 2, (zh - target_h) // 2
-        f_img = z_img.crop((cx, cy, cx + target_w, cy + target_h))
-        
-        current_words = [s["word"] for s in subtitles if s["start"] <= t <= s["end"] + 0.15]
-        active_str = " ".join(current_words).upper()
-        return np.array(overlay_subtitles_on_frame(f_img, active_str))
+    if is_motion_video and VideoFileClip:
+        # Usar video con movimiento de Kling AI
+        base_clip = VideoFileClip(visual_path)
+        if base_clip.duration < total_duration:
+            base_clip = base_clip.loop(duration=total_duration)
+        else:
+            base_clip = base_clip.subclip(0, total_duration)
 
-    video_clip = ImageClip(np.array(cropped_img)).set_duration(total_duration)
-    video_with_fx = video_clip.fl(lambda gf, t: frame_generator(t))
+        def frame_generator(gf, t):
+            frame = gf(t)
+            pil_f = Image.fromarray(frame)
+            current_words = [s["word"] for s in subtitles if s["start"] <= t <= s["end"] + 0.15]
+            active_str = " ".join(current_words).upper()
+            return np.array(overlay_subtitles_on_frame(pil_f, active_str))
 
-    # Mezcla: Voz principal + SFX al inicio
+        video_with_fx = base_clip.fl(frame_generator)
+    else:
+        # Fallback a zoom dinámico sobre imagen
+        target_w, target_h = 1080, 1920
+        base_img = Image.open(visual_path).convert("RGB")
+        w, h = base_img.size
+        scale = max(target_w / w, target_h / h)
+        nw, nh = int(w * scale), int(h * scale)
+        resized_img = base_img.resize((nw, nh), Image.Resampling.LANCZOS)
+        left = (nw - target_w) // 2
+        top = (nh - target_h) // 2
+        cropped_img = resized_img.crop((left, top, left + target_w, top + target_h))
+
+        def frame_gen_static(t):
+            zoom_factor = 1.0 + 0.05 * (t / max(total_duration, 1))
+            zw, zh = int(target_w * zoom_factor), int(target_h * zoom_factor)
+            z_img = cropped_img.resize((zw, zh), Image.Resampling.BILINEAR)
+            cx, cy = (zw - target_w) // 2, (zh - target_h) // 2
+            f_img = z_img.crop((cx, cy, cx + target_w, cy + target_h))
+            current_words = [s["word"] for s in subtitles if s["start"] <= t <= s["end"] + 0.15]
+            active_str = " ".join(current_words).upper()
+            return np.array(overlay_subtitles_on_frame(f_img, active_str))
+
+        clip_img = ImageClip(np.array(cropped_img)).set_duration(total_duration)
+        video_with_fx = clip_img.fl(lambda gf, t: frame_gen_static(t))
+
+    # Pistas de audio: Voz + SFX inicial
     audio_tracks = [voice_clip.volumex(1.0)]
     sfx_path = get_action_sfx()
     if sfx_path and os.path.exists(sfx_path):
@@ -351,7 +405,7 @@ def renew_tiktok_token():
 
 def upload_video_to_tiktok(video_path: str):
     if not os.path.exists(video_path):
-        raise FileNotFoundError("Video no encontrado.")
+        raise FileNotFoundError("Video inexistente.")
     file_size = os.path.getsize(video_path)
     access_token = st.session_state["tiktok_access_token"]
 
@@ -386,7 +440,7 @@ def upload_video_to_tiktok(video_path: str):
 # 6. SIDEBAR Y ESTADO
 # ==============================================================================
 
-st.sidebar.title("⚡ Conexiones del Sistema")
+st.sidebar.title("⚡ Panel de Conexiones")
 
 # Gemini
 gemini_key = st.sidebar.text_input("Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
@@ -394,35 +448,39 @@ if gemini_key:
     ok_gem, msg_gem = verify_gemini_api_key(gemini_key)
     st.sidebar.success(f"✅ {msg_gem}") if ok_gem else st.sidebar.error(f"❌ {msg_gem}")
 
-# Supabase Status
+# Kling AI
+st.sidebar.markdown("---")
+kling_key_input = st.sidebar.text_input("Kling AI API Key", value=DEFAULT_KLING_KEY, type="password")
+if kling_key_input:
+    st.sidebar.success("✅ Kling AI Vinculado (Motion Video)")
+
+# Supabase
 st.sidebar.markdown("---")
 if supabase:
     st.sidebar.success("✅ Supabase DB Conectada")
 else:
-    st.sidebar.warning("⚠️ Sin conexión a Supabase (Modo local)")
+    st.sidebar.warning("⚠️ Sin conexión a Supabase")
 
-# Telegram
+# Telegram & TikTok
 st.sidebar.markdown("---")
 telegram_token = st.sidebar.text_input("Telegram Bot Token", value=DEFAULT_TG_TOKEN, type="password")
 telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=DEFAULT_TG_CHAT)
 if telegram_token and telegram_chat_id:
     st.sidebar.success("✅ Telegram Bot Activo")
 
-# TikTok
-st.sidebar.markdown("---")
 if st.session_state["tiktok_access_token"]:
     st.sidebar.success("✅ TikTok Sandbox Vinculado")
 
 
 # ==============================================================================
-# 7. WORKFLOW: GENERACIÓN VIRAL COMPLETA
+# 7. WORKFLOW PRINCIPAL
 # ==============================================================================
 
-st.title("🎬 Manga Studio: Productor Autónomo Total")
+st.title("🎬 Manga Studio: Generador con Kling AI & TikTok")
 
 tabs = st.tabs([
-    "🚀 1. Episodio Autónomo (IA + Metadatos + SFX + Telegram)",
-    "📑 2. Historial de Episodios (Supabase)",
+    "🚀 1. Productor Autónomo (Kling Motion + Voz + Subs + TikTok)",
+    "📑 2. Historial de Capítulos (Supabase)",
     "📤 3. Publicación Manual"
 ])
 
@@ -439,37 +497,39 @@ with tabs[0]:
         height=70
     )
 
-    col_v, col_btn = st.columns([2, 2])
+    col_v, col_opt = st.columns([2, 2])
     with col_v:
         selected_voice = st.selectbox("Voz de Narración:", ["es-MX-JorgeNeural (Acción)", "es-ES-AlvaroNeural (Épico)"])
         voice_id = selected_voice.split(" ")[0]
+    with col_opt:
+        use_kling = st.checkbox("Generar movimiento real con Kling AI", value=True)
 
-    if st.button("🔥 Generar Capítulo Completo y Notificar a Telegram", type="primary"):
+    if st.button("🔥 Generar Episodio Completo y Publicar en Telegram", type="primary"):
         if not gemini_key:
             st.error("Requiere Gemini API Key.")
         else:
-            with st.status("Ejecutando producción...", expanded=True) as status:
-                # 1. Gemini: Generación de guion + metadatos virales
-                st.write("🧠 1. Creando guion, título viral y hashtags optimizados...")
+            with st.status("Ejecutando pipeline autónomo...", expanded=True) as status:
+                # 1. Gemini: Guion y Metadatos
+                st.write("🧠 1. Diseñando guion, título viral y hashtags...")
                 prompt_gem = f"""
-                Eres un estratega de contenido viral en TikTok y director de Manhwas de acción.
-                Basado en esta premisa del capítulo {next_chapter}: '{premise_input}'
-                Devuelve exactamente este formato:
-                TITULO: (Título corto con gancho y emoji para TikTok, máx 5 palabras)
-                DESCRIPCION: (2 líneas con suspenso/cliffhanger para retener)
-                HASHTAGS: (Exactamente 5 hashtags separados por espacio)
-                NARRACION: (Frase en español dramática para narrar en 7-9 segundos)
-                PROMPT: (Prompt visual en inglés para la escena de acción vertical)
+                Eres un director de Manhwas de acción para TikTok.
+                Premisa del capítulo {next_chapter}: '{premise_input}'
+                Devuelve EXACTAMENTE:
+                TITULO: (Título corto con emoji para TikTok)
+                DESCRIPCION: (2 líneas con suspenso/cliffhanger)
+                HASHTAGS: (5 hashtags separados por espacio)
+                NARRACION: (Frase corta de acción en español para narrar en 6-8 segundos)
+                PROMPT: (Prompt visual en inglés de la escena)
                 """
                 url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
                 res_g = requests.post(url_g, headers={"Content-Type": "application/json"}, json={"contents": [{"parts": [{"text": prompt_gem}]}]}, timeout=30)
                 gem_text = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-                title = f"Capítulo {next_chapter}: Emboscada Fatal ⚠️"
-                desc = "No había escapatoria. Las sombras de Seúl cobraron vida."
+                title = f"Capítulo {next_chapter}: El Escape ⚠️"
+                desc = "Las sombras de Seúl cobraron vida. No hay salida."
                 tags = "#manhwa #cyberpunk #action #webtoon #anime"
                 narracion = "El protocolo cero ha comenzado. Ya no hay marcha atrás."
-                img_prompt = "running across wet rooftops, dodging gunfire from attack drones"
+                img_prompt = "running across wet neon rooftops, dodging laser gunfire"
 
                 for line in gem_text.split("\n"):
                     if line.startswith("TITULO:"):
@@ -486,66 +546,78 @@ with tabs[0]:
                 # 2. Guardar en Supabase
                 ep_id = save_episode_to_supabase(next_chapter, title, desc, tags, img_prompt, narracion)
 
-                # 3. Audio + Subtítulos con Edge-TTS
-                st.write("🗣️ 2. Sintetizando voz y marcas de tiempo...")
+                # 3. Audio + Subtítulos
+                st.write("🗣️ 2. Sintetizando voz y marcas de tiempo con Edge-TTS...")
                 temp_aud = "/tmp/aud.mp3" if os.name != "nt" else "aud.mp3"
                 subtitles = asyncio.run(synthesize_speech_with_subtitles(narracion, voice_id, temp_aud))
 
-                # 4. Imagen con Fallback
-                st.write("🎨 3. Generando arte manhwa con consistencia visual...")
+                # 4. Imagen Base
+                st.write("🎨 3. Generando arte base manhwa...")
                 temp_img = "/tmp/img.png" if os.name != "nt" else "img.png"
-                ok_img, prov = generate_image_with_fallback(img_prompt, DEFAULT_HF_TOKEN, temp_img, seed=42 + next_chapter)
+                ok_img, prov = generate_image_base(img_prompt, DEFAULT_HF_TOKEN, temp_img, seed=42 + next_chapter)
 
-                # 5. Render final con SFX y Subs
-                st.write("🎬 4. Renderizando video vertical 9:16 con efecto de sonido de impacto...")
+                # 5. Kling AI Motion Video o Zoom
+                visual_source = temp_img
+                is_motion = False
+                if use_kling and DEFAULT_KLING_KEY:
+                    st.write("🎬 4. Generando física y animación real con Kling AI (5 segundos)...")
+                    temp_kling = "/tmp/kling_motion.mp4" if os.name != "nt" else "kling_motion.mp4"
+                    ok_kling, msg_kling = generate_video_with_kling(temp_img, img_prompt, temp_kling, duration="5")
+                    if ok_kling:
+                        visual_source = temp_kling
+                        is_motion = True
+                    else:
+                        st.warning(f"Kling falló ({msg_kling}). Usando efecto zoom dinámico.")
+
+                # 6. Render final (Montaje + Subs + SFX)
+                st.write("🎞️ 5. Ensamblando video vertical 9:16 con subtítulos dinámicos y SFX...")
                 final_out = "/tmp/ep_final.mp4" if os.name != "nt" else "ep_final.mp4"
-                build_final_video_with_audio_and_sfx(temp_img, temp_aud, subtitles, final_out)
+                build_final_video_with_audio_and_sfx(visual_source, temp_aud, subtitles, final_out, is_motion_video=is_motion)
 
                 st.session_state["latest_video_path"] = final_out
-                status.update(label="¡Video renderizado con éxito!", state="complete")
+                status.update(label="¡Video final renderizado!", state="complete")
 
-                st.success("🎉 Video ensamblado con metadatos virales:")
+                st.success("🎉 Video completado con animación y subtítulos:")
                 st.video(final_out)
 
                 st.markdown(f"**Título:** {title}")
                 st.markdown(f"**Descripción:** {desc}")
                 st.markdown(f"**Hashtags:** `{tags}`")
 
-                # 6. Enviar a Telegram con botones interactivos
+                # 7. Telegram
                 if telegram_token and telegram_chat_id:
                     tg_msg = f"🎬 **{title}**\n\n{desc}\n\n{tags}\n\n🎙️ *{narracion}*"
-                    ok_tg, resp_tg = send_telegram_with_approval(telegram_token, telegram_chat_id, tg_msg, final_out, ep_id)
-                    if ok_tg:
-                        st.info("📲 Video enviado a tu Telegram con botones interactivos: [ ✅ Publicar en TikTok ] / [ 🔄 Regenerar ]")
+                    send_telegram_with_approval(telegram_token, telegram_chat_id, tg_msg, final_out, ep_id)
+                    st.info("📲 Video enviado a Telegram con botones de aprobación rápida.")
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 2: Historial en Supabase
 # ------------------------------------------------------------------------------
 with tabs[1]:
-    st.subheader("Estado de los 10 Capítulos en Supabase")
+    st.subheader("Estado de los Capítulos en Supabase")
     if supabase:
         try:
             records = supabase.table("manga_episodes").select("*").order("chapter_num", desc=False).execute()
             if records.data:
                 st.dataframe(records.data, use_container_width=True)
             else:
-                st.info("Aún no hay capítulos registrados en la base de datos.")
+                st.info("Sin registros previos en Supabase.")
         except Exception as err:
             st.error(f"Error consultando Supabase: {err}")
     else:
-        st.warning("Configura tu URL y Key de Supabase en Secrets para habilitar la memoria persistente.")
+        st.warning("Configura Supabase en Secrets.")
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 3: Publicación Directa
+# PESTAÑA 3: Publicación Manual
 # ------------------------------------------------------------------------------
 with tabs[2]:
-    st.subheader("Publicación Inmediata a Borradores")
+    st.subheader("Publicación Inmediata a TikTok Inbox")
     if "latest_video_path" in st.session_state and os.path.exists(st.session_state["latest_video_path"]):
         st.video(st.session_state["latest_video_path"])
-        if st.button("📤 Subir este video a TikTok Inbox"):
+        if st.button("📤 Subir a TikTok Inbox"):
             try:
                 pid = upload_video_to_tiktok(st.session_state["latest_video_path"])
-                st.success(f"¡Subido con éxito! Publish ID: `{pid}`")
+                st.success(f"¡Subido exitosamente! Publish ID: `{pid}`")
             except Exception as e:
                 st.error(f"Error al subir: {e}")
     else:
