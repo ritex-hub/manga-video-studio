@@ -8,3 +8,4 @@ requests
 urllib3
 moviepy==1.0.3
 numpy
+supabase
