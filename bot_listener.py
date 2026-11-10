@@ -1,54 +1,118 @@
 import os
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
-from supabase import create_client
 
-# Variables de entorno leídas desde la configuración del servidor
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ---------------------------------------------------------
+# 1. SERVIDOR HTTP DUMMY PARA SATISFACER EL HEALTH-CHECK DE RENDER
+# ---------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Telegram Listener Bot is LIVE!")
+
+    def log_message(self, format, *args):
+        return  # Silenciar logs HTTP innecesarios
+
+def run_health_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"🌍 Servidor Health-Check respondiendo en puerto {port}")
+    server.serve_forever()
+
+# Iniciar servidor web en segundo plano
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# ---------------------------------------------------------
+# 2. TELEGRAM LISTENER (POLLING PURO SIN DEPENDENCIAS INCOMPATIBLES)
+# ---------------------------------------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9107826349:AAF3wV6KsnGBco7kIc0Qoi15K_yPr_qrDQA")
 SB_URL = os.getenv("SUPABASE_URL", "https://xfarkrxclnhibjvbrpxt.supabase.co")
-SB_KEY = os.getenv("SUPABASE_KEY")
-TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")
+SB_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_i3Sn59uhvXjPiA7XmzWCEg_VkR-deY1")
 
-supabase = None
-if SB_URL and SB_KEY:
+TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN.strip()}"
+
+def update_supabase_status(episode_id: str, new_status: str):
+    """Actualiza la tabla manga_episodes mediante llamada REST limpia."""
+    if not SB_URL or not SB_KEY:
+        print("⚠️ Supabase no configurado.")
+        return False
+    endpoint = f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?id=eq.{episode_id}"
+    headers = {
+        "apikey": SB_KEY.strip(),
+        "Authorization": f"Bearer {SB_KEY.strip()}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
     try:
-        supabase = create_client(SB_URL, SB_KEY)
+        r = requests.patch(endpoint, headers=headers, json={"status": new_status}, timeout=10)
+        return r.status_code in [200, 204]
     except Exception as e:
-        print(f"Error conectando Supabase: {e}")
+        print(f"Error actualizando Supabase: {e}")
+        return False
 
-async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+def answer_callback(callback_id: str, text: str = ""):
+    try:
+        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text}, timeout=10)
+    except Exception:
+        pass
 
-    if data.startswith("publish_"):
-        episode_id = data.replace("publish_", "")
-        await query.edit_message_caption(caption=f"⏳ Procesando publicación del episodio #{episode_id} a TikTok...")
-        
-        # 1. Actualizar estado en Supabase
-        if supabase:
-            try:
-                supabase.table("manga_episodes").update({"status": "uploaded"}).eq("id", episode_id).execute()
-            except Exception as ex:
-                print(f"Error al actualizar Supabase: {ex}")
+def edit_caption(chat_id: int, message_id: int, new_caption: str):
+    try:
+        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": new_caption}, timeout=10)
+    except Exception:
+        pass
 
-        await query.edit_message_caption(caption=f"✅ ¡Episodio #{episode_id} marcado como publicado en TikTok!")
-
-    elif data.startswith("retry_"):
-        episode_id = data.replace("retry_", "")
-        if supabase:
-            try:
-                supabase.table("manga_episodes").update({"status": "retry_requested"}).eq("id", episode_id).execute()
-            except Exception:
-                pass
-        await query.edit_message_caption(caption=f"🔄 Solicitud de regeneración registrada para el episodio #{episode_id}.")
-
-if __name__ == "__main__":
+def start_polling():
     if not BOT_TOKEN:
         print("❌ Error: TELEGRAM_BOT_TOKEN no configurado.")
-    else:
-        print("🚀 Telegram Webhook Listener activo y escuchando botones...")
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        app.add_handler(CallbackQueryHandler(handle_button_click))
-        app.run_polling()
+        return
+
+    print("🚀 Telegram Bot Listener iniciado con éxito en Render...")
+    offset = 0
+
+    while True:
+        try:
+            url = f"{TG_API_BASE}/getUpdates?timeout=30&offset={offset}"
+            res = requests.get(url, timeout=40)
+            data = res.json()
+
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+
+                if "callback_query" in update:
+                    cb = update["callback_query"]
+                    cb_id = cb["id"]
+                    cb_data = cb.get("data", "")
+                    msg = cb.get("message", {})
+                    chat_id = msg.get("chat", {}).get("id")
+                    message_id = msg.get("message_id")
+
+                    if cb_data.startswith("publish_"):
+                        ep_id = cb_data.replace("publish_", "")
+                        answer_callback(cb_id, text="Subiendo a TikTok...")
+                        ok = update_supabase_status(ep_id, "uploaded")
+                        msg_txt = f"✅ ¡Episodio #{ep_id} marcado como publicado en TikTok!" if ok else f"⚠️ Error en BD para episodio #{ep_id}."
+                        edit_caption(chat_id, message_id, msg_txt)
+
+                    elif cb_data.startswith("retry_"):
+                        ep_id = cb_data.replace("retry_", "")
+                        answer_callback(cb_id, text="Regenerando...")
+                        update_supabase_status(ep_id, "retry_requested")
+                        edit_caption(chat_id, message_id, f"🔄 Solicitud de regeneración registrada para el episodio #{ep_id}.")
+
+        except requests.exceptions.RequestException:
+            time.sleep(3)
+        except Exception as e:
+            print(f"Error en bucle de polling: {e}")
+            time.sleep(2)
+
+if __name__ == "__main__":
+    start_polling()
