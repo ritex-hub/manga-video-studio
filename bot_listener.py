@@ -4,9 +4,6 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
-# ---------------------------------------------------------
-# 1. SERVIDOR HTTP DUMMY PARA SATISFACER EL HEALTH-CHECK DE RENDER
-# ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -15,20 +12,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Telegram Listener Bot is LIVE!")
 
     def log_message(self, format, *args):
-        return  # Silenciar logs HTTP innecesarios
+        return
 
 def run_health_server():
     port = int(os.getenv("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"🌍 Servidor Health-Check respondiendo en puerto {port}")
     server.serve_forever()
 
-# Iniciar servidor web en segundo plano
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# ---------------------------------------------------------
-# 2. TELEGRAM LISTENER (POLLING PURO SIN DEPENDENCIAS INCOMPATIBLES)
-# ---------------------------------------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9107826349:AAF3wV6KsnGBco7kIc0Qoi15K_yPr_qrDQA")
 SB_URL = os.getenv("SUPABASE_URL", "https://xfarkrxclnhibjvbrpxt.supabase.co")
 SB_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_i3Sn59uhvXjPiA7XmzWCEg_VkR-deY1")
@@ -36,9 +28,7 @@ SB_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_i3Sn59uhvXjPiA7XmzWCEg_VkR-de
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN.strip()}"
 
 def update_supabase_status(episode_id: str, new_status: str):
-    """Actualiza la tabla manga_episodes mediante llamada REST limpia."""
     if not SB_URL or not SB_KEY:
-        print("⚠️ Supabase no configurado.")
         return False
     endpoint = f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?id=eq.{episode_id}"
     headers = {
@@ -71,7 +61,7 @@ def start_polling():
         print("❌ Error: TELEGRAM_BOT_TOKEN no configurado.")
         return
 
-    print("🚀 Telegram Bot Listener iniciado con éxito en Render...")
+    print("🚀 Telegram Bot Listener activo y en espera de eventos...")
     offset = 0
 
     while True:
