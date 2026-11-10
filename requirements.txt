@@ -10,3 +10,4 @@ moviepy==1.0.3
 numpy
 supabase
 gradio_client
+python-telegram-bot==20.7
