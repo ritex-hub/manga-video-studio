@@ -36,15 +36,6 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-try:
-    from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-except ImportError:
-    Credentials = None
-    build = None
-    MediaFileUpload = None
-
 VOICE_ROLES = {
     "NARRADOR": ("es-ES-AlvaroNeural", "+0Hz", "+0%"),
     "PROTAGONISTA": ("es-MX-JorgeNeural", "+2Hz", "+5%"),
@@ -61,7 +52,7 @@ def get_sb_headers(sb_key: str):
     }
 
 def upload_to_supabase_storage(sb_url: str, sb_key: str, local_path: str, remote_filename: str, content_type: str = "video/mp4"):
-    """Sube un video o retrato al bucket público 'manga-media' y devuelve su URL pública."""
+    """Sube un video o retrato al contenedor público 'manga-media' y devuelve su URL."""
     if not sb_url or not sb_key or not os.path.exists(local_path):
         return ""
     base = sb_url.rstrip("/")
@@ -170,7 +161,6 @@ def get_script_details(sb_url: str, sb_key: str, series_name: str):
 # ==============================================================================
 
 def generate_character_portrait(char_prompt: str, hf_token: str, out_path: str = "/tmp/char_portrait.png"):
-    """Genera el retrato oficial del protagonista para mantener su rostro en toda la temporada."""
     full_p = f"portrait close up of {char_prompt}, manhwa character sheet, front view, clean line art, studio lighting"
     if hf_token:
         try:
@@ -195,10 +185,8 @@ def generate_character_portrait(char_prompt: str, hf_token: str, out_path: str =
     return None
 
 def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str, hf_token: str, output_path: str, seed: int = 42):
-    """Usa el retrato de referencia (Image-to-Image) si existe, o texto-a-imagen con ancla visual."""
     full_prompt = f"{char_anchor}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
 
-    # Intento Image-to-Image si hay retrato guardado y token de HF
     if ref_image_url and hf_token:
         try:
             r_ref = requests.get(ref_image_url, timeout=15)
@@ -308,7 +296,6 @@ def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_
     draw = ImageDraw.Draw(pil_img)
     w, h = pil_img.size
 
-    # A) Hook visual superior en los primeros 2.5 segundos de la Escena 1
     if hook_banner and current_time <= 2.5:
         try:
             h_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
@@ -318,11 +305,9 @@ def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_
         hw, hh = hb[2] - hb[0], hb[3] - hb[1]
         hx = (w - hw) // 2
         hy = int(h * 0.14)
-        # Caja roja/morada llamativa detrás del título
         draw.rectangle([hx - 24, hy - 14, hx + hw + 24, hy + hh + 18], fill=(180, 20, 60))
         draw.text((hx, hy), hook_banner.upper(), font=h_font, fill=(255, 255, 255))
 
-    # B) Subtítulos dinámicos palabra por palabra (verde neón activo)
     if not subtitles:
         return pil_img
 
@@ -417,10 +402,8 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
 
         scene = ImageClip(np.array(crp)).set_duration(dur).fl(lambda gf, t: frame_zoom(t))
 
-    # Transición rápida de entrada (flash/fade)
     scene = fadein(scene, 0.25)
 
-    # Mezcla de Voz + Efecto de Sonido (SFX) al inicio de la escena
     audio_tracks = [voice_clip]
     if sfx_path and os.path.exists(sfx_path):
         try:
@@ -437,7 +420,7 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
     return out_mp4
 
 # ==============================================================================
-# 4. PUBLICACIÓN EN TIKTOK Y YOUTUBE SHORTS
+# 4. PUBLICACIÓN DIRECTA EN TIKTOK
 # ==============================================================================
 
 def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
@@ -462,44 +445,6 @@ def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
         return r_up.status_code in [200, 201], "Subido a bandeja de TikTok."
     except Exception as e:
         return False, str(e)
-
-def publish_to_youtube_shorts(video_path: str, title: str, description: str, yt_config: dict):
-    """Sube el video vertical directamente como YouTube Short usando OAuth Refresh Token."""
-    if not Credentials or not build or not MediaFileUpload:
-        return False, "Librerías de Google API no instaladas."
-    client_id = yt_config.get("client_id", "")
-    client_secret = yt_config.get("client_secret", "")
-    refresh_token = yt_config.get("refresh_token", "")
-    if not (client_id and client_secret and refresh_token and os.path.exists(video_path)):
-        return False, "Faltan credenciales de YouTube en Secrets/Render."
-
-    try:
-        creds = Credentials(
-            token=None,
-            refresh_token=refresh_token.strip(),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_id.strip(),
-            client_secret=client_secret.strip()
-        )
-        youtube = build("youtube", "v3", credentials=creds)
-        body = {
-            "snippet": {
-                "title": f"{title[:85]} #Shorts",
-                "description": f"{description}\n\n#Shorts #Anime #Manhwa",
-                "tags": ["Shorts", "Anime", "Manhwa", "Manga"],
-                "categoryId": "24"
-            },
-            "status": {
-                "privacyStatus": "public",
-                "selfDeclaredMadeForKids": False
-            }
-        }
-        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        response = request.execute()
-        return True, f"Publicado en YouTube Shorts (ID: {response.get('id')})"
-    except Exception as e:
-        return False, f"Error YouTube: {e}"
 
 # ==============================================================================
 # 5. PIPELINE MAESTRO DE PRODUCCIÓN COMPLETA
@@ -617,7 +562,6 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     for c in clips:
         c.close()
 
-    # Subir video final a Supabase Storage para que Telegram/Render pueda publicarlo en TikTok y YouTube
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", series_name)
     public_video_url = upload_to_supabase_storage(sb_url, sb_key, out_final, f"videos/{safe_name}_cap_{next_chap}.mp4", "video/mp4")
 
@@ -627,15 +571,10 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
 
     if tg_token and tg_chat and os.path.exists(out_final):
         keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Publicar TikTok + YT Shorts", "callback_data": f"publish_all_{ep_id}"},
-                    {"text": "📱 Solo TikTok", "callback_data": f"publish_tk_{ep_id}"}
-                ],
-                [
-                    {"text": "🔄 Regenerar Capítulo", "callback_data": f"retry_{ep_id}"}
-                ]
-            ]
+            "inline_keyboard": [[
+                {"text": "✅ Publicar en TikTok", "callback_data": f"publish_tk_{ep_id}"},
+                {"text": "🔄 Regenerar Capítulo", "callback_data": f"retry_{ep_id}"}
+            ]]
         }
         url_tg = f"https://api.telegram.org/bot{tg_token.strip()}/sendVideo"
         with open(out_final, "rb") as vf:
