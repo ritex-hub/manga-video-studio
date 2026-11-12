@@ -77,15 +77,20 @@ def get_sb_headers(sb_key: str):
         "Prefer": "return=representation"
     }
 
-def call_gemini_api(gemini_key: str, parts: list, timeout: int = 35):
-    """Llama a Gemini 2.5 Flash con respaldo automático y manejo seguro de errores."""
+def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
+    """Llama a Gemini 3.8 Flash con respaldo automático y autenticación compatible."""
     if not gemini_key:
         raise ValueError("Falta configurar la Gemini API Key en Secrets.")
+    key_clean = gemini_key.strip()
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key_clean
+    }
     last_err = ""
-    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key.strip()}"
+    for model in ["gemini-3.8-flash", "gemini-2.5-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            res = requests.post(url, json={"contents": [{"parts": parts}]}, timeout=timeout)
+            res = requests.post(url, headers=headers, json={"contents": [{"parts": parts}]}, timeout=timeout)
             data = res.json()
             if "candidates" in data and data["candidates"]:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -553,7 +558,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
       ]
     }}
     """
-    txt = call_gemini_api(gemini_key, [{"text": gem_prompt}], timeout=35)
+    txt = call_gemini_api(gemini_key, [{"text": gem_prompt}], timeout=40)
     script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
     title = script_data["title"]
