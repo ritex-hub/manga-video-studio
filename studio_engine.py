@@ -77,21 +77,49 @@ def get_sb_headers(sb_key: str):
         "Prefer": "return=representation"
     }
 
-def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
-    """Llama a Gemini 2.5 Flash / Pro validando que la API Key sea formato AIzaSy..."""
-    if not gemini_key:
-        raise ValueError("Falta configurar la Gemini API Key en Secrets.")
-    key_clean = gemini_key.strip()
-    if not key_clean.startswith("AIza"):
-        raise ValueError("Tu clave actual empieza por 'AQ.' y no es válida para esta API. Genera una clave nueva en aistudio.google.com/apikey que empiece por 'AIzaSy...'.")
+def discover_gemini_models(key_clean: str, headers: dict):
+    """Consulta a la API de Google qué modelos tiene habilitados exactamente esta clave."""
+    discovered = []
+    for ver in ["v1beta", "v1"]:
+        try:
+            r = requests.get(f"https://generativelanguage.googleapis.com/{ver}/models", headers=headers, timeout=10)
+            if r.status_code == 200:
+                for m in r.json().get("models", []):
+                    methods = m.get("supportedGenerationMethods", [])
+                    name = m.get("name", "")
+                    if "generateContent" in methods and "gemini" in name:
+                        discovered.append(f"https://generativelanguage.googleapis.com/{ver}/{name}:generateContent")
+        except Exception:
+            pass
+    return discovered
 
+def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
+    """Toma cualquier API Key tal cual sin exigir formato y detecta automáticamente el modelo disponible."""
+    if not gemini_key or not gemini_key.strip():
+        raise ValueError("Falta configurar la Gemini API Key en Secrets.")
+
+    key_clean = gemini_key.strip()
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": key_clean
     }
+
+    # 1. Primero consulta dinámicamente qué modelos tiene autorizados tu clave
+    endpoints = discover_gemini_models(key_clean, headers)
+
+    # 2. Respaldos directos por si el listado no responde
+    fallback_endpoints = [
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+        "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ]
+    for ep in fallback_endpoints:
+        if ep not in endpoints:
+            endpoints.append(ep)
+
     last_err = ""
-    for model in ["gemini-2.5-flash", "gemini-2.5-pro"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    for url in endpoints:
         try:
             res = requests.post(url, headers=headers, json={"contents": [{"parts": parts}]}, timeout=timeout)
             data = res.json()
@@ -100,6 +128,7 @@ def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
             last_err = data.get("error", {}).get("message", str(data))
         except Exception as e:
             last_err = str(e)
+
     raise RuntimeError(f"Error de Gemini API: {last_err}")
 
 def translate_prompt_to_english(text: str, gemini_key: str) -> str:
