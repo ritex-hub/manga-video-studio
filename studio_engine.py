@@ -78,16 +78,19 @@ def get_sb_headers(sb_key: str):
     }
 
 def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
-    """Llama a Gemini 3.8 Flash con respaldo automático y autenticación compatible."""
+    """Llama a Gemini 2.5 Flash / Pro validando que la API Key sea formato AIzaSy..."""
     if not gemini_key:
         raise ValueError("Falta configurar la Gemini API Key en Secrets.")
     key_clean = gemini_key.strip()
+    if not key_clean.startswith("AIza"):
+        raise ValueError("Tu clave actual empieza por 'AQ.' y no es válida para esta API. Genera una clave nueva en aistudio.google.com/apikey que empiece por 'AIzaSy...'.")
+
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": key_clean
     }
     last_err = ""
-    for model in ["gemini-3.8-flash", "gemini-2.5-flash"]:
+    for model in ["gemini-2.5-flash", "gemini-2.5-pro"]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
             res = requests.post(url, headers=headers, json={"contents": [{"parts": parts}]}, timeout=timeout)
