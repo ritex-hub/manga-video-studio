@@ -7,8 +7,7 @@ import requests
 from studio_engine import (
     produce_series_episode,
     get_sb_headers,
-    publish_to_tiktok_api,
-    publish_to_youtube_shorts
+    publish_to_tiktok_api
 )
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -16,7 +15,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Manga Studio Pro Worker (TikTok + YT Shorts + Auto-Pilot) LIVE!")
+        self.wfile.write(b"Manga Studio Pro Worker (TikTok + Multi-Series Auto-Pilot) LIVE!")
 
     def log_message(self, format, *args):
         return
@@ -36,13 +35,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 HF_TOKEN = os.getenv("HF_API_TOKEN", "")
 FS_KEY = os.getenv("FREESOUND_API_KEY", "")
 MODAL_URL = os.getenv("MODAL_ENDPOINT_URL", "")
-
 TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN", "")
-YT_CONFIG = {
-    "client_id": os.getenv("YOUTUBE_CLIENT_ID", ""),
-    "client_secret": os.getenv("YOUTUBE_CLIENT_SECRET", ""),
-    "refresh_token": os.getenv("YOUTUBE_REFRESH_TOKEN", "")
-}
 
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN.strip()}" if BOT_TOKEN else ""
 
@@ -86,7 +79,7 @@ def update_supabase_status(episode_id: str, new_status: str):
     except Exception:
         return False
 
-def execute_social_publish(episode_id: str, publish_yt: bool, chat_id: int, message_id: int):
+def execute_tiktok_publish(episode_id: str, chat_id: int, message_id: int):
     ep = get_episode_from_db(episode_id)
     if not ep or not ep.get("video_url"):
         requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"⚠️ No se encontró el archivo de video del Episodio #{episode_id}."}, timeout=10)
@@ -103,14 +96,14 @@ def execute_social_publish(episode_id: str, publish_yt: bool, chat_id: int, mess
 
     title_full = f"{ep['title']} {ep.get('hashtags', '')}"
     ok_tk, msg_tk = publish_to_tiktok_api(local_mp4, title_full, TIKTOK_ACCESS_TOKEN)
-    report = f"📱 TikTok: {msg_tk}"
 
-    if publish_yt:
-        ok_yt, msg_yt = publish_to_youtube_shorts(local_mp4, ep["title"], ep.get("description", ""), YT_CONFIG)
-        report += f"\n▶️ YouTube: {msg_yt}"
+    if ok_tk:
+        update_supabase_status(episode_id, "published")
+        caption_res = f"✅ **Episodio #{episode_id} enviado a TikTok**\n{msg_tk}"
+    else:
+        caption_res = f"⚠️ **Aviso TikTok (Ep. #{episode_id}):** {msg_tk}"
 
-    update_supabase_status(episode_id, "published")
-    requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"✅ **Episodio #{episode_id} Procesado**\n{report}"}, timeout=10)
+    requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": caption_res}, timeout=10)
 
 def get_all_saved_series():
     if not SB_URL or not SB_KEY:
@@ -197,15 +190,10 @@ def start_polling():
                     chat_id = msg.get("chat", {}).get("id")
                     message_id = msg.get("message_id")
 
-                    if cb_data.startswith("publish_all_"):
-                        ep_id = cb_data.replace("publish_all_", "")
-                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Subiendo a TikTok y YouTube..."}, timeout=10)
-                        threading.Thread(target=execute_social_publish, args=(ep_id, True, chat_id, message_id), daemon=True).start()
-
-                    elif cb_data.startswith("publish_tk_"):
+                    if cb_data.startswith("publish_tk_"):
                         ep_id = cb_data.replace("publish_tk_", "")
                         requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Subiendo a TikTok..."}, timeout=10)
-                        threading.Thread(target=execute_social_publish, args=(ep_id, False, chat_id, message_id), daemon=True).start()
+                        threading.Thread(target=execute_tiktok_publish, args=(ep_id, chat_id, message_id), daemon=True).start()
 
                     elif cb_data.startswith("retry_"):
                         ep_id = cb_data.replace("retry_", "")
