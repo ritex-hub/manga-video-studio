@@ -1,6 +1,7 @@
 streamlit
 pymupdf
 edge-tts
+gTTS
 google-genai
 pillow
 opencv-python-headless
