@@ -36,11 +36,38 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-VOICE_ROLES = {
-    "NARRADOR": ("es-ES-AlvaroNeural", "+0Hz", "+0%"),
-    "PROTAGONISTA": ("es-MX-JorgeNeural", "+2Hz", "+5%"),
-    "CHICA": ("es-MX-DaliaNeural", "+4Hz", "+3%"),
-    "VILLANO": ("es-AR-TomasNeural", "-18Hz", "-5%")
+# Mapeo de voces multi-personaje por idioma seleccionado
+VOICE_ROLES_BY_LANG = {
+    "Español": {
+        "NARRADOR": ("es-ES-AlvaroNeural", "+0Hz", "+0%"),
+        "PROTAGONISTA": ("es-MX-JorgeNeural", "+2Hz", "+5%"),
+        "CHICA": ("es-MX-DaliaNeural", "+4Hz", "+3%"),
+        "VILLANO": ("es-AR-TomasNeural", "-18Hz", "-5%")
+    },
+    "Inglés": {
+        "NARRADOR": ("en-US-ChristopherNeural", "+0Hz", "+0%"),
+        "PROTAGONISTA": ("en-US-GuyNeural", "+2Hz", "+5%"),
+        "CHICA": ("en-US-JennyNeural", "+4Hz", "+3%"),
+        "VILLANO": ("en-GB-RyanNeural", "-18Hz", "-5%")
+    },
+    "Portugués": {
+        "NARRADOR": ("pt-BR-AntonioNeural", "+0Hz", "+0%"),
+        "PROTAGONISTA": ("pt-BR-FabioNeural", "+2Hz", "+5%"),
+        "CHICA": ("pt-BR-FranciscaNeural", "+4Hz", "+3%"),
+        "VILLANO": ("pt-PT-DuarteNeural", "-18Hz", "-5%")
+    },
+    "Francés": {
+        "NARRADOR": ("fr-FR-HenriNeural", "+0Hz", "+0%"),
+        "PROTAGONISTA": ("fr-CA-AntoineNeural", "+2Hz", "+5%"),
+        "CHICA": ("fr-FR-DeniseNeural", "+4Hz", "+3%"),
+        "VILLANO": ("fr-FR-AlainNeural", "-18Hz", "-5%")
+    },
+    "Japonés": {
+        "NARRADOR": ("ja-JP-KeitaNeural", "+0Hz", "+0%"),
+        "PROTAGONISTA": ("ja-JP-DaichiNeural", "+2Hz", "+5%"),
+        "CHICA": ("ja-JP-NanamiNeural", "+4Hz", "+3%"),
+        "VILLANO": ("ja-JP-NaokiNeural", "-18Hz", "-5%")
+    }
 }
 
 def get_sb_headers(sb_key: str):
@@ -51,8 +78,22 @@ def get_sb_headers(sb_key: str):
         "Prefer": "return=representation"
     }
 
+def translate_prompt_to_english(text: str, gemini_key: str) -> str:
+    """Traduce automáticamente la ficha visual al inglés si el usuario la escribió en otro idioma."""
+    if not text or not gemini_key:
+        return text
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
+        prompt = f"Translate this anime character visual description into concise English image-generation keywords (only return the English keywords, nothing else): '{text}'"
+        res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
+        if res.status_code == 200:
+            translated = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return translated if translated else text
+    except Exception:
+        pass
+    return text
+
 def upload_to_supabase_storage(sb_url: str, sb_key: str, local_path: str, remote_filename: str, content_type: str = "video/mp4"):
-    """Sube un video o retrato al contenedor público 'manga-media' y devuelve su URL."""
     if not sb_url or not sb_key or not os.path.exists(local_path):
         return ""
     base = sb_url.rstrip("/")
@@ -160,8 +201,9 @@ def get_script_details(sb_url: str, sb_key: str, series_name: str):
 # 1. MEMORIA VISUAL REAL (RETRATO FIJO + IMAGE-TO-IMAGE)
 # ==============================================================================
 
-def generate_character_portrait(char_prompt: str, hf_token: str, out_path: str = "/tmp/char_portrait.png"):
-    full_p = f"portrait close up of {char_prompt}, manhwa character sheet, front view, clean line art, studio lighting"
+def generate_character_portrait(char_prompt: str, hf_token: str, gemini_key: str = "", out_path: str = "/tmp/char_portrait.png"):
+    en_prompt = translate_prompt_to_english(char_prompt, gemini_key)
+    full_p = f"portrait close up of {en_prompt}, manhwa character sheet, front view, clean line art, studio lighting"
     if hf_token:
         try:
             api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
@@ -227,7 +269,7 @@ def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str
     return False
 
 # ==============================================================================
-# 2. EFECTOS DE SONIDO (SFX) + MÚSICA (BGM) + MULTI-VOZ
+# 2. EFECTOS DE SONIDO (SFX) + MÚSICA (BGM) + MULTI-VOZ MULTI-IDIOMA
 # ==============================================================================
 
 def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_dur: int, output_path: str):
@@ -248,10 +290,12 @@ def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_d
         pass
     return None
 
-async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: str):
+async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: str, language: str = "Español"):
     temp_clips = []
     all_subtitles = []
     current_offset = 0.0
+
+    lang_voices = VOICE_ROLES_BY_LANG.get(language, VOICE_ROLES_BY_LANG["Español"])
 
     for idx, line in enumerate(dialogue_lines):
         role = line.get("role", "NARRADOR").upper()
@@ -259,7 +303,7 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
         if not text:
             continue
 
-        voice, pitch, rate = VOICE_ROLES.get(role, VOICE_ROLES["NARRADOR"])
+        voice, pitch, rate = lang_voices.get(role, lang_voices["NARRADOR"])
         part_path = f"/tmp/mv_part_{idx}.mp3"
 
         communicate = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
@@ -450,7 +494,7 @@ def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
 # 5. PIPELINE MAESTRO DE PRODUCCIÓN COMPLETA
 # ==============================================================================
 
-def produce_series_episode(series_name: str, custom_direction: str, config: dict, progress_callback=None):
+def produce_series_episode(series_name: str, custom_direction: str, config: dict, language_override: str = "", progress_callback=None):
     def log(msg):
         if progress_callback:
             progress_callback(msg)
@@ -467,24 +511,27 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     next_chap, prev_summary = get_series_continuity(sb_url, sb_key, series_name)
     script_obj = get_script_details(sb_url, sb_key, series_name)
 
-    char_anchor = script_obj.get("character_prompt") if script_obj and script_obj.get("character_prompt") else "young anime warrior, detailed manhwa style"
+    target_lang = language_override or (script_obj.get("language") if script_obj and script_obj.get("language") else "Español")
+    raw_char = script_obj.get("character_prompt") if script_obj and script_obj.get("character_prompt") else "young anime warrior, detailed manhwa style"
+    char_anchor = translate_prompt_to_english(raw_char, gemini_key)
     ref_img_url = script_obj.get("reference_image_url", "") if script_obj else ""
     master_ref = f"\nGUION MAESTRO:\n{script_obj['script_content'][:2500]}" if script_obj else ""
 
-    log(f"🧠 Escribiendo guion con SFX y Hook viral para '{series_name}' — Cap. #{next_chap}...")
+    log(f"🧠 Escribiendo guion en **{target_lang}** con SFX y Hook para '{series_name}' — Cap. #{next_chap}...")
 
     gem_prompt = f"""
     Eres el director de la serie '{series_name}'. Escribe el CAPÍTULO #{next_chap} en 3 escenas consecutivas.
+    IDIOMA OBLIGATORIO PARA TODO EL TEXTO, DIÁLOGOS Y HOOK: {target_lang}.
     LO QUE YA PASÓ ANTES (PROHIBIDO REPETIR): '{prev_summary}'.
     DIRECCIÓN: '{custom_direction}'.
     {master_ref}
     Asigna roles usando SOLO: NARRADOR, PROTAGONISTA, CHICA, VILLANO.
-    Incluye un 'hook_banner' corto (máx 5 palabras en español) y un 'sfx_query' (1-2 palabras en inglés para sonido de acción en Freesound).
+    Los campos 'prompt' y 'sfx_query' DEBEN ir en inglés para los motores visuales y de sonido; 'hook_banner', 'description' y 'dialogues[].text' DEBEN ir en {target_lang}.
     Responde ÚNICAMENTE en JSON válido:
     {{
       "title": "{series_name} - Cap. {next_chap}",
-      "hook_banner": "CAPÍTULO {next_chap}: ¡EL ATAQUE!",
-      "description": "Resumen breve de lo ocurrido en este capítulo para continuar en el siguiente",
+      "hook_banner": "Hook corto de máximo 5 palabras en {target_lang}",
+      "description": "Resumen breve en {target_lang} de lo ocurrido en este capítulo",
       "hashtags": "#manhwa #anime #webtoon #fyp",
       "mood_music": "cyberpunk dark synth epic action",
       "scenes": [
@@ -492,24 +539,24 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
           "prompt": "Detailed visual prompt in English for scene 1",
           "sfx_query": "sword unsheath",
           "dialogues": [
-            {{"role": "NARRADOR", "text": "Texto narrado"}},
-            {{"role": "PROTAGONISTA", "text": "Diálogo del héroe"}}
+            {{"role": "NARRADOR", "text": "Texto narrado en {target_lang}"}},
+            {{"role": "PROTAGONISTA", "text": "Diálogo del héroe en {target_lang}"}}
           ]
         }},
         {{
           "prompt": "Detailed visual prompt in English for scene 2",
           "sfx_query": "thunder explosion",
           "dialogues": [
-            {{"role": "VILLANO", "text": "Amenaza del enemigo"}},
-            {{"role": "CHICA", "text": "Reacción de aliada"}}
+            {{"role": "VILLANO", "text": "Amenaza del enemigo en {target_lang}"}},
+            {{"role": "CHICA", "text": "Reacción de aliada en {target_lang}"}}
           ]
         }},
         {{
           "prompt": "Detailed visual prompt in English for scene 3",
           "sfx_query": "energy blast",
           "dialogues": [
-            {{"role": "PROTAGONISTA", "text": "Ataque final"}},
-            {{"role": "NARRADOR", "text": "Gancho final del capítulo"}}
+            {{"role": "PROTAGONISTA", "text": "Ataque final en {target_lang}"}},
+            {{"role": "NARRADOR", "text": "Gancho final del capítulo en {target_lang}"}}
           ]
         }}
       ]
@@ -521,7 +568,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
     title = script_data["title"]
-    hook_text = script_data.get("hook_banner", f"CAPÍTULO {next_chap}")
+    hook_text = script_data.get("hook_banner", f"CAP. {next_chap}")
     desc = script_data["description"]
     tags = script_data["hashtags"]
     mood = script_data["mood_music"]
@@ -531,7 +578,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     rendered_files = []
 
     for idx, sc in enumerate(scenes):
-        log(f"🎬 Escena {idx+1}/3 (Memoria Visual + SFX + Multi-Voz)...")
+        log(f"🎬 Escena {idx+1}/3 ({target_lang} • Memoria Visual + SFX)...")
         img_f = f"/tmp/bg_s_{idx}.png"
         aud_f = f"/tmp/bg_a_{idx}.mp3"
         sfx_f = f"/tmp/bg_sfx_{idx}.mp3"
@@ -539,7 +586,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
         anim_f = f"/tmp/bg_anim_{idx}.mp4"
 
         generate_image_with_memory(sc["prompt"], char_anchor, ref_img_url, hf_token, img_f, seed=next_chap * 100 + idx)
-        subs = asyncio.run(synthesize_multivoice_speech(sc.get("dialogues", []), aud_f))
+        subs = asyncio.run(synthesize_multivoice_speech(sc.get("dialogues", []), aud_f, language=target_lang))
         sfx_path = get_freesound_audio(fs_key, sc.get("sfx_query", "whoosh"), 1, 4, sfx_f)
 
         ok_anim, engine = animate_image_cascade(img_f, anim_f, cluster_urls)
@@ -581,7 +628,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
             requests.post(
                 url_tg,
                 files={"video": vf},
-                data={"chat_id": tg_chat.strip(), "caption": f"🎬 **{title}**\n{desc}\n{tags}", "reply_markup": json.dumps(keyboard)},
+                data={"chat_id": tg_chat.strip(), "caption": f"🎬 **{title}** [{target_lang}]\n{desc}\n{tags}", "reply_markup": json.dumps(keyboard)},
                 timeout=90
             )
 
