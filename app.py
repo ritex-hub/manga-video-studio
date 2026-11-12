@@ -40,10 +40,72 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-st.set_page_config(page_title="Manga Studio AI: Serverless & Continuity", layout="wide", page_icon="🎬")
+# ==============================================================================
+# 1. CONFIGURACIÓN DE PÁGINA Y ESTILOS CSS ELEGANTES
+# ==============================================================================
+
+st.set_page_config(
+    page_title="Manga Studio AI | Production Hub",
+    layout="wide",
+    page_icon="🎬",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    /* Estilo general limpio y moderno */
+    .main-header {
+        background: linear-gradient(135deg, #1a1c29 0%, #2d1b4e 100%);
+        padding: 1.8rem;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        margin-bottom: 1.5rem;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    }
+    .main-header h1 {
+        color: #ffffff;
+        margin: 0;
+        font-size: 2.1rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+    }
+    .main-header p {
+        color: #b8c0e0;
+        margin: 0.4rem 0 0 0;
+        font-size: 1rem;
+    }
+    .status-card {
+        background-color: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.5rem;
+    }
+    .script-box {
+        background-color: #161822;
+        border-left: 4px solid #7c4dff;
+        padding: 1.2rem;
+        border-radius: 8px;
+        margin-top: 0.8rem;
+        margin-bottom: 1rem;
+    }
+    div.stButton > button[kind="primary"] {
+        background: linear-gradient(90deg, #6a11cb 0%, #2575fc 100%);
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        padding: 0.6rem 1.2rem;
+        transition: all 0.2s ease;
+    }
+    div.stButton > button[kind="primary"]:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 15px rgba(37, 117, 252, 0.4);
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ==============================================================================
-# 1. SECRETOS Y CONFIGURACIÓN
+# 2. SECRETOS Y CONSTANTES
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
@@ -75,10 +137,10 @@ NOTEBOOK_COLAB2 = get_secret("notebooks", "colab2_url", "https://colab.research.
 if "tiktok_access_token" not in st.session_state:
     st.session_state["tiktok_access_token"] = DEFAULT_ACCESS_TOKEN
 
-CHARACTER_ANCHOR = "Jun-woo, 24yo korean male soldier, short undercut black hair, left cybernetic glowing cyan eye, high collar black tactical jacket"
+CHARACTER_ANCHOR = "manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
 
 # ==============================================================================
-# 2. SUPABASE: CONTINUIDAD ESTRICTA Y CLUSTER AUTO-SYNC
+# 3. SUPABASE: GUIONES GUARDADOS, CONTINUIDAD Y CLUSTER
 # ==============================================================================
 
 def sb_headers():
@@ -109,6 +171,41 @@ def get_dynamic_cluster_urls():
     except Exception:
         pass
     return nodes
+
+def save_script_to_db(title: str, premise: str, script_content: str):
+    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY or not title.strip():
+        return False
+    url = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/saved_scripts"
+    headers = sb_headers()
+    headers["Prefer"] = "resolution=merge-duplicates"
+    payload = {
+        "title": title.strip(),
+        "premise": premise.strip(),
+        "script_content": script_content
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=8)
+        return r.status_code in [200, 201]
+    except Exception:
+        return False
+
+def fetch_saved_scripts():
+    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
+        return []
+    try:
+        r = requests.get(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/saved_scripts?select=*&order=created_at.desc", headers=sb_headers(), timeout=6)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def delete_saved_script(script_id: int):
+    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
+        return False
+    try:
+        r = requests.delete(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/saved_scripts?id=eq.{script_id}", headers=sb_headers(), timeout=6)
+        return r.status_code in [200, 204]
+    except Exception:
+        return False
 
 def get_series_continuity(series_name: str):
     if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
@@ -161,7 +258,7 @@ def fetch_recent_episodes():
     if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
         return []
     try:
-        r = requests.get(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=*&order=id.desc&limit=15", headers=sb_headers(), timeout=6)
+        r = requests.get(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=*&order=id.desc&limit=20", headers=sb_headers(), timeout=6)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
@@ -220,7 +317,7 @@ def upload_video_to_tiktok(video_path: str, title: str):
         return False, str(e)
 
 # ==============================================================================
-# 3. RENDERIZADO GPU EN CASCADA (MODAL -> KAGGLE -> COLAB)
+# 4. RENDERIZADO GPU EN CASCADA (MODAL -> KAGGLE -> COLAB)
 # ==============================================================================
 
 def render_motion_modal(modal_url: str, image_path: str, output_video_path: str):
@@ -254,7 +351,7 @@ def render_motion_gradio(endpoint_url: str, image_path: str, output_video_path: 
 def animate_image_cascade(image_path: str, output_video_path: str, cluster_urls: dict):
     if cluster_urls.get("modal"):
         if render_motion_modal(cluster_urls["modal"], image_path, output_video_path):
-            return True, "Modal Labs (Serverless)"
+            return True, "Modal Labs (Serverless 24/7)"
     for node_key, label in [("kaggle", "Kaggle T4"), ("colab1", "Colab 1"), ("colab2", "Colab 2")]:
         url = cluster_urls.get(node_key)
         if url and ping_url(url):
@@ -263,11 +360,11 @@ def animate_image_cascade(image_path: str, output_video_path: str, cluster_urls:
     return False, "Zoom Cinemático (CPU)"
 
 # ==============================================================================
-# 4. GENERACIÓN VISUAL, VOZ, MÚSICA Y MONTAJE
+# 5. GENERACIÓN VISUAL, VOZ, MÚSICA Y MONTAJE
 # ==============================================================================
 
 def generate_image_base(prompt: str, hf_token: str, output_path: str, seed: int = 42):
-    full_prompt = f"{CHARACTER_ANCHOR}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
+    full_prompt = f"{prompt}, {CHARACTER_ANCHOR}"
     if hf_token:
         try:
             api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
@@ -395,144 +492,280 @@ def analyze_manga_page_with_gemini(image_path: str, previous_page_context: str):
         return {"narration": "El combate entra en su fase más crítica mientras los poderes chocan.", "music_mood": "anime dramatic battle"}
 
 # ==============================================================================
-# 5. INTERFAZ STREAMLIT
+# 6. BARRA LATERAL COMPLETA (CLUSTER GPU + TODAS LAS PLATAFORMAS)
 # ==============================================================================
 
 cluster_urls = get_dynamic_cluster_urls()
 
-st.sidebar.title("⚡ Cluster GPU & Control")
-if cluster_urls.get("modal"):
-    st.sidebar.success("🚀 Modal Labs: Activo (24/7)")
-else:
-    st.sidebar.warning("⚠️ Modal Labs: Sin URL en Secrets")
+with st.sidebar:
+    st.markdown("## ⚡ Centro de Control")
+    if cluster_urls.get("modal"):
+        st.success("🚀 **Modal Labs:** Activo (24/7)")
+    else:
+        st.warning("⚠️ **Modal Labs:** Sin URL en Secrets")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Respaldo GPU (Auto-Sync URLs):**")
+    st.markdown("### 🖥️ Cluster GPU de Respaldo")
+    c1, c2 = st.columns([2.2, 1])
+    c1.markdown(f"**Kaggle T4:** {'🟢 Online' if ping_url(cluster_urls.get('kaggle')) else '🔴 Offline'}")
+    c2.link_button("Abrir", NOTEBOOK_KAGGLE, use_container_width=True)
 
-c1, c2 = st.sidebar.columns([2, 1])
-c1.markdown(f"**Kaggle:** {'🟢 Online' if ping_url(cluster_urls.get('kaggle')) else '🔴 Offline'}")
-c2.link_button("Abrir", NOTEBOOK_KAGGLE)
+    c3, c4 = st.columns([2.2, 1])
+    c3.markdown(f"**Colab 1:** {'🟢 Online' if ping_url(cluster_urls.get('colab1')) else '🔴 Offline'}")
+    c4.link_button("Abrir", NOTEBOOK_COLAB1, use_container_width=True)
 
-c3, c4 = st.sidebar.columns([2, 1])
-c3.markdown(f"**Colab 1:** {'🟢 Online' if ping_url(cluster_urls.get('colab1')) else '🔴 Offline'}")
-c4.link_button("Abrir", NOTEBOOK_COLAB1)
+    c5, c6 = st.columns([2.2, 1])
+    c5.markdown(f"**Colab 2:** {'🟢 Online' if ping_url(cluster_urls.get('colab2')) else '🔴 Offline'}")
+    c6.link_button("Abrir", NOTEBOOK_COLAB2, use_container_width=True)
 
-c5, c6 = st.sidebar.columns([2, 1])
-c5.markdown(f"**Colab 2:** {'🟢 Online' if ping_url(cluster_urls.get('colab2')) else '🔴 Offline'}")
-c6.link_button("Abrir", NOTEBOOK_COLAB2)
+    if st.button("🔄 Refrescar Estado Cluster", use_container_width=True):
+        st.rerun()
 
-if st.sidebar.button("🔄 Refrescar Estado Cluster"):
-    st.rerun()
+    st.markdown("---")
+    st.markdown("### 🔌 Plataformas Conectadas")
 
-st.title("🎬 Manga Studio AI: Continuidad & PDF-to-Anime")
+    sb_ok = bool(DEFAULT_SB_URL and DEFAULT_SB_KEY)
+    gem_ok = bool(DEFAULT_GEMINI_KEY)
+    hf_ok = bool(DEFAULT_HF_TOKEN)
+    fs_ok = bool(DEFAULT_FREESOUND_KEY)
+    tg_ok = bool(DEFAULT_TG_TOKEN and DEFAULT_TG_CHAT)
+    tk_ok = bool(st.session_state.get("tiktok_access_token"))
+
+    st.markdown(f"""
+    <div class="status-card">
+        <div>🗄️ <b>Supabase BD:</b> {'🟢 Conectado' if sb_ok else '🔴 Sin Secrets'}</div>
+        <div>🧠 <b>Gemini AI:</b> {'🟢 Listo' if gem_ok else '🔴 Sin Key'}</div>
+        <div>🎨 <b>Hugging Face:</b> {'🟢 Listo' if hf_ok else '🟡 Solo Pollinations'}</div>
+        <div>🎵 <b>Freesound BGM:</b> {'🟢 Listo' if fs_ok else '🔴 Sin Key'}</div>
+        <div>✈️ <b>Telegram Bot:</b> {'🟢 Conectado' if tg_ok else '🔴 Sin Token'}</div>
+        <div>📱 <b>TikTok API:</b> {'🟢 Token Activo' if tk_ok else '🔴 Sin Token'}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ==============================================================================
+# 7. ENCABEZADO Y PESTAÑAS PRINCIPALES
+# ==============================================================================
+
+st.markdown("""
+<div class="main-header">
+    <h1>🎬 Manga Studio AI — Production Hub</h1>
+    <p>Generación automatizada de series verticales con continuidad narrativa, biblioteca de guiones y conversión de Manga PDF a clips virales.</p>
+</div>
+""", unsafe_allow_html=True)
+
+saved_scripts_list = fetch_saved_scripts()
+recent_eps_list = fetch_recent_episodes()
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Motor Principal", "Modal T4 24/7" if cluster_urls.get("modal") else "Cluster GPU")
+m2.metric("Guiones Guardados", len(saved_scripts_list))
+m3.metric("Episodios Producidos", len(recent_eps_list))
+m4.metric("Formato de Salida", "1080x1920 (9:16)")
+
+st.markdown("<br>", unsafe_allow_html=True)
 
 tabs = st.tabs([
-    "🚀 Serie Original (Continuidad)",
+    "🚀 Producción de Series (Continuidad)",
+    "✨ Biblioteca y Creador de Guiones",
     "📚 Manga PDF a Clips (1 Min)",
-    "✨ Generador de Guiones IA",
-    "📑 Historial en Supabase"
+    "📑 Historial de Producción"
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: SERIE ORIGINAL CON CONTINUIDAD ESTRICTA (CERO REPETICIONES)
+# PESTAÑA 1: PRODUCCIÓN CON CONTINUIDAD Y SELECCIÓN DE GUION GUARDADO
 # ------------------------------------------------------------------------------
 with tabs[0]:
-    series_name = st.text_input("Nombre de la Serie:", value="Jun-woo: Neo-Seúl")
-    next_chap, prev_summary = get_series_continuity(series_name)
+    col_left, col_right = st.columns([1.15, 1])
 
-    st.subheader(f"Capítulo #{next_chap} (Continuación Automática)")
-    st.info(f"📖 **Contexto del capítulo anterior (para evitar repetir):** {prev_summary}")
+    with col_left:
+        st.subheader("1️⃣ Selección de Serie o Guion Guardado")
+        script_options = ["✍️ Escribir título personalizado..."] + [s["title"] for s in saved_scripts_list]
+        selected_option = st.selectbox("Elige un guion guardado para continuar su historia:", script_options)
 
-    premise_input = st.text_area(
-        "Dirección para este capítulo:",
-        value=f"Continúa la historia tras '{prev_summary}'. Jun-woo enfrenta un nuevo peligro en Neo-Seúl.",
-        height=70
-    )
-    col_v, col_tk = st.columns(2)
-    voice_sel = col_v.selectbox("Voz:", ["es-MX-JorgeNeural", "es-ES-AlvaroNeural"])
-    auto_tiktok = col_tk.checkbox("Subir automáticamente a bandeja de TikTok", value=False)
-
-    if st.button(f"🔥 Generar Capítulo #{next_chap} y Avanzar Historia", type="primary"):
-        if not DEFAULT_GEMINI_KEY:
-            st.error("Falta Gemini API Key.")
+        selected_script_obj = None
+        if selected_option != "✍️ Escribir título personalizado...":
+            series_name = selected_option
+            selected_script_obj = next((s for s in saved_scripts_list if s["title"] == selected_option), None)
         else:
-            with st.status(f"Produciendo Capítulo #{next_chap}...", expanded=True) as status:
-                gem_prompt = f"""
-                Eres el director de '{series_name}'. Escribe el CAPÍTULO #{next_chap} en 3 escenas consecutivas.
-                LO QUE YA PASÓ ANTES (NO REPETIR): '{prev_summary}'.
-                NUEVA DIRECCIÓN: '{premise_input}'.
-                Responde en JSON ESTRICTO:
-                {{
-                  "title": "Cap. {next_chap}: Título",
-                  "description": "Resumen de lo ocurrido en este capítulo para continuar en el siguiente",
-                  "hashtags": "#manhwa #cyberpunk #action",
-                  "mood_music": "cyberpunk dark synth fast",
-                  "scenes": [
-                    {{"prompt": "Scene 1 visual prompt in English", "narration": "Narración 1"}},
-                    {{"prompt": "Scene 2 visual prompt in English", "narration": "Narración 2"}},
-                    {{"prompt": "Scene 3 visual prompt in English", "narration": "Narración 3"}}
-                  ]
-                }}
-                """
-                url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
-                res_g = requests.post(url_g, json={"contents": [{"parts": [{"text": gem_prompt}]}]}, timeout=30)
-                txt = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
-                script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
+            series_name = st.text_input("Título de la Serie:", value="Jun-woo: Neo-Seúl")
 
-                title = script_data["title"]
-                desc = script_data["description"]
-                tags = script_data["hashtags"]
-                mood = script_data["mood_music"]
-                scenes = script_data["scenes"]
+        next_chap, prev_summary = get_series_continuity(series_name)
 
-                ep_id = save_episode_to_supabase(series_name, next_chap, title, desc, tags, scenes[0]["prompt"], scenes[0]["narration"], "processing")
+        st.markdown(f"""
+        <div class="script-box">
+            <b>📌 Serie Activa:</b> {series_name}  |  <b>🎬 Próximo Episodio:</b> Capítulo #{next_chap}<br>
+            <small style="color:#b8c0e0;"><b>Último evento registrado (para no repetir):</b> {prev_summary}</small>
+        </div>
+        """, unsafe_allow_html=True)
 
-                rendered_files = []
-                for idx, sc in enumerate(scenes):
-                    st.write(f"🎬 Escena {idx+1}/3: {sc['narration']}")
-                    img_f = f"/tmp/s1_{idx}.png"
-                    aud_f = f"/tmp/s1_{idx}.mp3"
-                    mp4_f = f"/tmp/s1_{idx}.mp4"
-                    anim_f = f"/tmp/a1_{idx}.mp4"
+        if selected_script_obj:
+            with st.expander("📖 Ver Guion Maestro Guardado de esta Serie", expanded=False):
+                st.markdown(selected_script_obj["script_content"])
 
-                    generate_image_base(sc["prompt"], DEFAULT_HF_TOKEN, img_f, seed=next_chap * 10 + idx)
-                    subs = asyncio.run(synthesize_speech(sc["narration"], voice_sel, aud_f))
-                    ok_anim, engine = animate_image_cascade(img_f, anim_f, cluster_urls)
-                    st.write(f"   ↳ Motor utilizado: **{engine}**")
-                    build_scene_clip(anim_f if ok_anim else img_f, aud_f, subs, mp4_f, is_video=ok_anim)
-                    rendered_files.append(mp4_f)
+    with col_right:
+        st.subheader("2️⃣ Dirección del Capítulo y Renderizado")
+        default_dir = f"Continúa exactamente la trama de '{series_name}' después de: '{prev_summary}'."
+        if selected_script_obj:
+            default_dir += f" Sigue la escaleta del guion maestro correspondiente al Capítulo #{next_chap}."
 
-                clips = [VideoFileClip(p) for p in rendered_files]
-                final_vid = concatenate_videoclips(clips, method="compose")
-                bgm_p = get_smart_bgm(mood)
-                if bgm_p and os.path.exists(bgm_p):
-                    bgm = AudioFileClip(bgm_p).volumex(0.14)
-                    bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
-                    final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
+        premise_input = st.text_area("Instrucciones para este capítulo:", value=default_dir, height=115)
 
-                out_final = f"/tmp/cap_{next_chap}_final.mp4"
-                final_vid.write_videofile(out_final, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
-                for c in clips:
-                    c.close()
+        c_v, c_tk = st.columns(2)
+        voice_sel = c_v.selectbox("Voz del Narrador:", ["es-MX-JorgeNeural", "es-ES-AlvaroNeural", "es-MX-DaliaNeural"])
+        auto_tiktok = c_tk.checkbox("Subir directo a bandeja de TikTok", value=False)
 
-                update_series_progress(series_name, next_chap, desc)
-                send_telegram_with_approval(DEFAULT_TG_TOKEN, DEFAULT_TG_CHAT, f"🎬 **{title}**\n{desc}\n{tags}", out_final, ep_id)
-                if auto_tiktok:
-                    ok_tk, msg_tk = upload_video_to_tiktok(out_final, f"{title} {tags}")
-                    st.write(f"📱 TikTok: {msg_tk}")
+        if st.button(f"🔥 Producir Capítulo #{next_chap} de '{series_name}'", type="primary", use_container_width=True):
+            if not DEFAULT_GEMINI_KEY:
+                st.error("⚠️ Falta configurar la Gemini API Key en Secrets.")
+            else:
+                with st.status(f"Produciendo '{series_name}' — Capítulo #{next_chap}...", expanded=True) as status:
+                    master_context = f"\nGUION MAESTRO DE REFERENCIA:\n{selected_script_obj['script_content'][:2500]}" if selected_script_obj else ""
+                    gem_prompt = f"""
+                    Eres el director de la serie '{series_name}'. Escribe el CAPÍTULO #{next_chap} dividido en 3 escenas consecutivas.
+                    LO QUE YA PASÓ ANTES (PROHIBIDO REPETIR): '{prev_summary}'.
+                    DIRECCIÓN PARA ESTE CAPÍTULO: '{premise_input}'.
+                    {master_context}
+                    Responde ÚNICAMENTE en JSON válido:
+                    {{
+                      "title": "{series_name} - Cap. {next_chap}",
+                      "description": "Resumen breve de lo que pasó en este capítulo para continuar en el siguiente",
+                      "hashtags": "#manhwa #anime #webtoon #fyp",
+                      "mood_music": "cyberpunk dark synth epic action",
+                      "scenes": [
+                        {{"prompt": "Detailed visual prompt in English for scene 1", "narration": "Narración en español 1"}},
+                        {{"prompt": "Detailed visual prompt in English for scene 2", "narration": "Narración en español 2"}},
+                        {{"prompt": "Detailed visual prompt in English for scene 3", "narration": "Narración en español 3"}}
+                      ]
+                    }}
+                    """
+                    url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
+                    res_g = requests.post(url_g, json={"contents": [{"parts": [{"text": gem_prompt}]}]}, timeout=30)
+                    txt = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
-                status.update(label=f"¡Capítulo #{next_chap} listo! El siguiente será el #{next_chap + 1}.", state="complete")
-                st.video(out_final)
+                    title = script_data["title"]
+                    desc = script_data["description"]
+                    tags = script_data["hashtags"]
+                    mood = script_data["mood_music"]
+                    scenes = script_data["scenes"]
+
+                    ep_id = save_episode_to_supabase(series_name, next_chap, title, desc, tags, scenes[0]["prompt"], scenes[0]["narration"], "processing")
+
+                    rendered_files = []
+                    for idx, sc in enumerate(scenes):
+                        st.write(f"🎬 **Escena {idx+1}/3:** {sc['narration']}")
+                        img_f = f"/tmp/s1_{idx}.png"
+                        aud_f = f"/tmp/s1_{idx}.mp3"
+                        mp4_f = f"/tmp/s1_{idx}.mp4"
+                        anim_f = f"/tmp/a1_{idx}.mp4"
+
+                        generate_image_base(sc["prompt"], DEFAULT_HF_TOKEN, img_f, seed=next_chap * 100 + idx)
+                        subs = asyncio.run(synthesize_speech(sc["narration"], voice_sel, aud_f))
+                        ok_anim, engine = animate_image_cascade(img_f, anim_f, cluster_urls)
+                        st.write(f"   ↳ Renderizado GPU: **{engine}**")
+                        build_scene_clip(anim_f if ok_anim else img_f, aud_f, subs, mp4_f, is_video=ok_anim)
+                        rendered_files.append(mp4_f)
+
+                    clips = [VideoFileClip(p) for p in rendered_files]
+                    final_vid = concatenate_videoclips(clips, method="compose")
+                    bgm_p = get_smart_bgm(mood)
+                    if bgm_p and os.path.exists(bgm_p):
+                        bgm = AudioFileClip(bgm_p).volumex(0.14)
+                        bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
+                        final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
+
+                    out_final = f"/tmp/cap_{next_chap}_final.mp4"
+                    final_vid.write_videofile(out_final, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+                    for c in clips:
+                        c.close()
+
+                    update_series_progress(series_name, next_chap, desc)
+                    send_telegram_with_approval(DEFAULT_TG_TOKEN, DEFAULT_TG_CHAT, f"🎬 **{title}**\n{desc}\n{tags}", out_final, ep_id)
+                    if auto_tiktok:
+                        _, msg_tk = upload_video_to_tiktok(out_final, f"{title} {tags}")
+                        st.write(f"📱 TikTok: {msg_tk}")
+
+                    status.update(label=f"✅ ¡{title} completado! Listo para continuar en el Capítulo #{next_chap + 1}.", state="complete")
+                    st.video(out_final)
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 2: SUBIR PDF DE MANGA -> CLIPS DE 1 MINUTO CON GUION Y MÚSICA
+# PESTAÑA 2: BIBLIOTECA Y CREADOR DE GUIONES CON TÍTULO
 # ------------------------------------------------------------------------------
 with tabs[1]:
+    col_gen, col_lib = st.columns([1.1, 1])
+
+    with col_gen:
+        st.subheader("✍️ Crear y Guardar Nuevo Guion")
+        new_script_title = st.text_input("Título Identificador de la Serie (Ej: El Despertar del Abismo):", key="new_title_input")
+        num_caps = st.slider("Cantidad de capítulos a planificar:", min_value=3, max_value=10, value=5)
+        idea = st.text_area("Premisa, personajes principales y estilo de la historia:", height=120, placeholder="Ej: Un cazador rango E descubre un reloj que retrocede 10 segundos en cada pelea...")
+
+        if st.button("🧠 Generar Escaleta de Guion con IA", type="primary", use_container_width=True):
+            if not DEFAULT_GEMINI_KEY or not idea:
+                st.warning("Escribe una premisa y verifica tu API Key de Gemini.")
+            else:
+                with st.spinner("Escribiendo guion estructurado por capítulos..."):
+                    url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
+                    prompt_s = f"""
+                    Crea un guion estructurado de {num_caps} capítulos conectados con cliffhangers para una serie vertical estilo Manhwa/Anime.
+                    Título de la serie: '{new_script_title if new_script_title else "Serie Nueva"}'.
+                    Premisa: {idea}.
+                    Detalla claramente Capítulo 1, Capítulo 2, ..., Capítulo {num_caps} con su trama y gancho final.
+                    """
+                    res = requests.post(url_g, json={"contents": [{"parts": [{"text": prompt_s}]}]}, timeout=30)
+                    generated_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    st.session_state["draft_script"] = generated_text
+                    st.session_state["draft_title"] = new_script_title
+                    st.session_state["draft_premise"] = idea
+
+        if "draft_script" in st.session_state:
+            st.markdown("### 📝 Borrador Generado (Editable)")
+            edited_title = st.text_input("Confirma el Título con el que se guardará:", value=st.session_state.get("draft_title", ""))
+            edited_script = st.text_area("Contenido del Guion:", value=st.session_state["draft_script"], height=260)
+
+            if st.button("💾 Guardar Guion en Supabase para Producir", use_container_width=True):
+                if not edited_title.strip():
+                    st.error("Por favor asigna un título para poder identificar el guion.")
+                else:
+                    ok_save = save_script_to_db(edited_title, st.session_state.get("draft_premise", ""), edited_script)
+                    if ok_save:
+                        st.success(f"✅ Guion **'{edited_title}'** guardado. Ya puedes seleccionarlo en la pestaña **🚀 Producción de Series**.")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("No se pudo guardar en Supabase. Verifica que hayas ejecutado el SQL de `saved_scripts`.")
+
+    with col_lib:
+        st.subheader("📚 Guiones Guardados en Biblioteca")
+        if not saved_scripts_list:
+            st.info("Aún no tienes guiones guardados. Crea uno a la izquierda y guárdalo con su título.")
+        else:
+            for item in saved_scripts_list:
+                chap_next, last_sum = get_series_continuity(item["title"])
+                with st.expander(f"🎬 {item['title']}  —  (Va en el Cap. #{chap_next})"):
+                    st.caption(f"**Último avance:** {last_sum}")
+                    st.markdown(item["script_content"])
+                    if st.button("🗑️ Eliminar Guion", key=f"del_{item['id']}"):
+                        delete_saved_script(item["id"])
+                        st.rerun()
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 3: SUBIR PDF DE MANGA -> CLIPS DE 1 MINUTO
+# ------------------------------------------------------------------------------
+with tabs[2]:
     st.subheader("📚 Convertir PDF de Manga en Clips de 1 Minuto")
-    uploaded_pdf = st.file_uploader("Sube tu archivo Manga (.pdf)", type=["pdf"])
-    manga_series = st.text_input("Nombre del Manga (para llevar control de partes):", value="Manga PDF Viral")
-    next_part_start, prev_manga_ctx = get_series_continuity(manga_series)
-    st.caption(f"Continuará a partir de la **Parte #{next_part_start}**.")
+    col_pdf1, col_pdf2 = st.columns([1.2, 1])
+    with col_pdf1:
+        uploaded_pdf = st.file_uploader("Sube tu archivo Manga (.pdf)", type=["pdf"])
+        manga_series = st.text_input("Título del Manga (para continuar por partes sin repetir):", value="Manga PDF Viral")
+    with col_pdf2:
+        next_part_start, prev_manga_ctx = get_series_continuity(manga_series)
+        st.markdown(f"""
+        <div class="script-box">
+            <b>📖 Manga:</b> {manga_series}<br>
+            <b>▶️ Continuará desde:</b> Parte #{next_part_start}<br>
+            <small style="color:#b8c0e0;">{prev_manga_ctx}</small>
+        </div>
+        """, unsafe_allow_html=True)
 
     if uploaded_pdf and st.button("🎬 Animar PDF y Cortar en Clips de 1 Minuto", type="primary"):
         if fitz and DEFAULT_GEMINI_KEY:
@@ -543,7 +776,7 @@ with tabs[1]:
                 mood_bgm = "anime epic battle"
 
                 for i in range(len(doc)):
-                    st.write(f"📖 Página {i+1}/{len(doc)}...")
+                    st.write(f"📖 Analizando y animando página {i+1}/{len(doc)}...")
                     pix = doc.load_page(i).get_pixmap(dpi=150)
                     img_p = f"/tmp/pdf_p_{i}.jpg"
                     pix.save(img_p)
@@ -598,25 +831,14 @@ with tabs[1]:
                     st.video(final_p)
                     current_p_num += 1
 
-                status.update(label="¡Clips de 1 minuto generados y guardados en continuidad!", state="complete")
-
-# ------------------------------------------------------------------------------
-# PESTAÑA 3: GENERADOR DE GUIONES IA
-# ------------------------------------------------------------------------------
-with tabs[2]:
-    st.subheader("✨ Generador de Ideas y Guiones por Temporada")
-    idea = st.text_area("Escribe la premisa base de tu nueva historia:")
-    if st.button("🧠 Crear Guion de 3 Capítulos"):
-        if DEFAULT_GEMINI_KEY and idea:
-            url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
-            res = requests.post(url_g, json={"contents": [{"parts": [{"text": f"Crea una escaleta de 3 capítulos conectados con cliffhangers basada en: {idea}"}]}]}, timeout=25)
-            st.markdown(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+                status.update(label="✅ ¡Clips de 1 minuto generados y guardados en continuidad!", state="complete")
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 4: HISTORIAL Y CONTINUIDAD EN SUPABASE
 # ------------------------------------------------------------------------------
 with tabs[3]:
     st.subheader("📑 Registro de Capítulos Producidos")
-    recs = fetch_recent_episodes()
-    if recs:
-        st.dataframe(recs, use_container_width=True)
+    if recent_eps_list:
+        st.dataframe(recent_eps_list, use_container_width=True)
+    else:
+        st.info("Aún no hay episodios registrados en Supabase.")
