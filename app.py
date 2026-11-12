@@ -11,7 +11,11 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
-# Dependencias multimedia
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
 try:
     import edge_tts
 except ImportError:
@@ -36,10 +40,10 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-st.set_page_config(page_title="Manga Video Studio Pro", layout="wide", page_icon="🎬")
+st.set_page_config(page_title="Manga Studio AI: Serverless & Continuity", layout="wide", page_icon="🎬")
 
 # ==============================================================================
-# 1. EXTRACCIÓN DINÁMICA DE SECRETOS (STREAMLIT SECRETS)
+# 1. SECRETOS Y CONFIGURACIÓN
 # ==============================================================================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
@@ -51,18 +55,11 @@ def get_secret(section: str, key: str, default: str = "") -> str:
 
 DEFAULT_GEMINI_KEY = get_secret("gemini", "api_key", "")
 DEFAULT_HF_TOKEN = get_secret("huggingface", "api_token", "")
-
 DEFAULT_SB_URL = get_secret("supabase", "url", "")
 DEFAULT_SB_KEY = get_secret("supabase", "key", "")
+DEFAULT_MODAL_URL = get_secret("modal", "endpoint_url", "")
 
-DEFAULT_COLAB_1 = get_secret("colab", "url_colab1", "")
-DEFAULT_COLAB_2 = get_secret("colab", "url_colab2", "")
-DEFAULT_KAGGLE = get_secret("colab", "url_kaggle", "")
-
-DEFAULT_KLING_KEY = get_secret("kling", "api_key", "")
-DEFAULT_LUMA_KEY = get_secret("luma", "api_key", "")
 DEFAULT_FREESOUND_KEY = get_secret("freesound", "api_key", "")
-
 DEFAULT_TG_TOKEN = get_secret("telegram", "bot_token", "")
 DEFAULT_TG_CHAT = get_secret("telegram", "chat_id", "")
 
@@ -71,16 +68,17 @@ DEFAULT_CLIENT_SECRET = get_secret("tiktok", "client_secret", "")
 DEFAULT_ACCESS_TOKEN = get_secret("tiktok", "access_token", "")
 DEFAULT_REFRESH_TOKEN = get_secret("tiktok", "refresh_token", "")
 
+NOTEBOOK_KAGGLE = get_secret("notebooks", "kaggle_url", "https://www.kaggle.com/code")
+NOTEBOOK_COLAB1 = get_secret("notebooks", "colab1_url", "https://colab.research.google.com/")
+NOTEBOOK_COLAB2 = get_secret("notebooks", "colab2_url", "https://colab.research.google.com/")
+
 if "tiktok_access_token" not in st.session_state:
     st.session_state["tiktok_access_token"] = DEFAULT_ACCESS_TOKEN
-
-if "tiktok_refresh_token" not in st.session_state:
-    st.session_state["tiktok_refresh_token"] = DEFAULT_REFRESH_TOKEN
 
 CHARACTER_ANCHOR = "Jun-woo, 24yo korean male soldier, short undercut black hair, left cybernetic glowing cyan eye, high collar black tactical jacket"
 
 # ==============================================================================
-# 2. CLIENTE REST SUPABASE (DIRECTO, SIN DEPENDENCIAS ROTAS)
+# 2. SUPABASE: CONTINUIDAD ESTRICTA Y CLUSTER AUTO-SYNC
 # ==============================================================================
 
 def sb_headers():
@@ -91,38 +89,58 @@ def sb_headers():
         "Prefer": "return=representation"
     }
 
-def test_supabase_connection():
+def get_dynamic_cluster_urls():
+    nodes = {
+        "modal": DEFAULT_MODAL_URL,
+        "kaggle": get_secret("colab", "url_kaggle", ""),
+        "colab1": get_secret("colab", "url_colab1", ""),
+        "colab2": get_secret("colab", "url_colab2", "")
+    }
     if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
-        return False, "Faltan credenciales en Secrets"
-    endpoint = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=id&limit=1"
+        return nodes
     try:
-        r = requests.get(endpoint, headers=sb_headers(), timeout=5)
-        if r.status_code in [200, 206]:
-            return True, "Conectado"
-        return False, f"HTTP {r.status_code}: {r.text}"
-    except Exception as e:
-        return False, str(e)
-
-def get_current_episode_number():
-    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
-        return 1
-    endpoint = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=chapter_num&order=chapter_num.desc&limit=1"
-    try:
-        r = requests.get(endpoint, headers=sb_headers(), timeout=6)
+        r = requests.get(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/cluster_nodes?select=*", headers=sb_headers(), timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            if data and len(data) > 0:
-                last = data[0]["chapter_num"]
-                return 1 if last >= 10 else last + 1
-        return 1
+            for row in r.json():
+                name = row.get("node_name")
+                url = row.get("url", "").strip()
+                if name in nodes and url:
+                    nodes[name] = url
     except Exception:
-        return 1
+        pass
+    return nodes
 
-def save_episode_to_supabase(chapter_num, title, desc, tags, prompt, narr, status="pending"):
+def get_series_continuity(series_name: str):
+    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
+        return 1, "Inicio de la historia."
+    url = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/series_progress?series_name=eq.{urllib.parse.quote(series_name)}"
+    try:
+        r = requests.get(url, headers=sb_headers(), timeout=6)
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            return row.get("last_chapter", 0) + 1, row.get("last_summary", "Inicio de la historia.")
+    except Exception:
+        pass
+    return 1, "Inicio de la historia."
+
+def update_series_progress(series_name: str, chapter_num: int, summary: str):
+    if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
+        return
+    url = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/series_progress"
+    headers = sb_headers()
+    headers["Prefer"] = "resolution=merge-duplicates"
+    payload = {"series_name": series_name, "last_chapter": chapter_num, "last_summary": summary}
+    try:
+        requests.post(url, headers=headers, json=payload, timeout=8)
+    except Exception:
+        pass
+
+def save_episode_to_supabase(series_name, chapter_num, title, desc, tags, prompt, narr, status="pending"):
     if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
         return 0
     endpoint = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes"
     payload = {
+        "series_name": series_name,
         "chapter_num": chapter_num,
         "title": title,
         "description": desc,
@@ -133,119 +151,164 @@ def save_episode_to_supabase(chapter_num, title, desc, tags, prompt, narr, statu
     }
     try:
         r = requests.post(endpoint, headers=sb_headers(), json=payload, timeout=8)
-        if r.status_code in [200, 201]:
-            data = r.json()
-            if data and len(data) > 0:
-                return data[0].get("id", 0)
-        return 0
-    except Exception as e:
-        st.error(f"Error guardando en Supabase: {e}")
-        return 0
+        if r.status_code in [200, 201] and r.json():
+            return r.json()[0].get("id", 0)
+    except Exception:
+        pass
+    return 0
 
-def fetch_all_episodes():
+def fetch_recent_episodes():
     if not DEFAULT_SB_URL or not DEFAULT_SB_KEY:
         return []
-    endpoint = f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=*&order=id.desc&limit=10"
     try:
-        r = requests.get(endpoint, headers=sb_headers(), timeout=8)
-        if r.status_code == 200:
-            return r.json()
-        return []
+        r = requests.get(f"{DEFAULT_SB_URL.rstrip('/')}/rest/v1/manga_episodes?select=*&order=id.desc&limit=15", headers=sb_headers(), timeout=6)
+        return r.json() if r.status_code == 200 else []
     except Exception:
         return []
 
-# ==============================================================================
-# 3. VALIDACIONES Y TELEGRAM
-# ==============================================================================
-
-@st.cache_data(ttl=300, show_spinner=False)
-def verify_gemini_api_key(api_key: str):
-    if not api_key or len(api_key.strip()) < 10:
-        return False, "Clave incompleta"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key.strip()}"
-    try:
-        res = requests.get(url, timeout=5)
-        return (True, "Conectado a Gemini") if res.status_code == 200 else (False, "Clave inválida")
-    except Exception as e:
-        return False, f"Error: {e}"
-
-def ping_gradio_url(url: str):
+def ping_url(url: str):
     if not url:
         return False
     try:
         r = requests.get(url.strip(), timeout=4)
-        return r.status_code == 200
+        return r.status_code in [200, 405]
     except Exception:
         return False
 
 def send_telegram_with_approval(bot_token: str, chat_id: str, message: str, video_path: str = None, episode_id: int = 0):
     if not bot_token or not chat_id:
-        return False, "Faltan credenciales de Telegram"
+        return False
     keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Publicar en TikTok", "callback_data": f"publish_{episode_id}"},
-                {"text": "🔄 Regenerar Escena", "callback_data": f"retry_{episode_id}"}
-            ]
-        ]
+        "inline_keyboard": [[
+            {"text": "✅ Publicar en TikTok", "callback_data": f"publish_{episode_id}"},
+            {"text": "🔄 Regenerar", "callback_data": f"retry_{episode_id}"}
+        ]]
     }
-    reply_markup = json.dumps(keyboard)
     try:
         if video_path and os.path.exists(video_path):
             url = f"https://api.telegram.org/bot{bot_token.strip()}/sendVideo"
             with open(video_path, "rb") as vf:
-                files = {"video": vf}
-                data = {"chat_id": chat_id.strip(), "caption": message, "reply_markup": reply_markup}
-                res = requests.post(url, files=files, data=data, timeout=90)
-        else:
-            url = f"https://api.telegram.org/bot{bot_token.strip()}/sendMessage"
-            payload = {"chat_id": chat_id.strip(), "text": message, "reply_markup": reply_markup}
-            res = requests.post(url, json=payload, timeout=10)
-        return res.status_code == 200, res.text
-    except Exception as ex:
-        return False, str(ex)
+                res = requests.post(url, files={"video": vf}, data={"chat_id": chat_id.strip(), "caption": message, "reply_markup": json.dumps(keyboard)}, timeout=90)
+            return res.status_code == 200
+    except Exception:
+        pass
+    return False
+
+def upload_video_to_tiktok(video_path: str, title: str):
+    access_token = st.session_state.get("tiktok_access_token", "")
+    if not access_token or not os.path.exists(video_path):
+        return False, "Falta Access Token de TikTok o archivo de video."
+    file_size = os.path.getsize(video_path)
+    init_url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "post_info": {"title": title[:150], "privacy_level": "SELF_ONLY"},
+        "source_info": {"source": "FILE_UPLOAD", "video_size": file_size, "chunk_size": file_size, "total_chunk_count": 1}
+    }
+    try:
+        r_init = requests.post(init_url, headers=headers, json=payload, timeout=20)
+        data = r_init.json().get("data", {})
+        upload_url = data.get("upload_url")
+        if not upload_url:
+            return False, f"Error init TikTok: {r_init.text}"
+        with open(video_path, "rb") as f:
+            vid_bytes = f.read()
+        up_headers = {"Content-Range": f"bytes 0-{file_size-1}/{file_size}", "Content-Type": "video/mp4"}
+        r_up = requests.put(upload_url, headers=up_headers, data=vid_bytes, timeout=60)
+        return r_up.status_code in [200, 201], "Subido a bandeja de TikTok."
+    except Exception as e:
+        return False, str(e)
 
 # ==============================================================================
-# 4. AUDIO Y BGM CONTEXTUAL INTELIGENTE (FREESOUND)
+# 3. RENDERIZADO GPU EN CASCADA (MODAL -> KAGGLE -> COLAB)
 # ==============================================================================
 
-def get_action_sfx():
-    sfx_path = "/tmp/action_sfx.mp3" if os.name != "nt" else "action_sfx.mp3"
-    if not os.path.exists(sfx_path):
-        sample_url = "https://cdn.pixabay.com/download/audio/2021/08/04/audio_12b0c7443c.mp3?filename=hit-impact-metal-85341.mp3"
+def render_motion_modal(modal_url: str, image_path: str, output_video_path: str):
+    if not modal_url:
+        return False
+    try:
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        res = requests.post(modal_url.strip(), json={"image_base64": img_b64}, timeout=120)
+        if res.status_code == 200 and "video_base64" in res.json():
+            with open(output_video_path, "wb") as vf:
+                vf.write(base64.b64decode(res.json()["video_base64"]))
+            return True
+    except Exception:
+        pass
+    return False
+
+def render_motion_gradio(endpoint_url: str, image_path: str, output_video_path: str):
+    if not GradioClient or not handle_file or not endpoint_url:
+        return False
+    try:
+        client = GradioClient(endpoint_url.strip())
+        result = client.predict(input_img=handle_file(image_path), api_name="/generate_motion")
+        if result and os.path.exists(result):
+            shutil.copy(result, output_video_path)
+            return True
+    except Exception:
+        pass
+    return False
+
+def animate_image_cascade(image_path: str, output_video_path: str, cluster_urls: dict):
+    if cluster_urls.get("modal"):
+        if render_motion_modal(cluster_urls["modal"], image_path, output_video_path):
+            return True, "Modal Labs (Serverless)"
+    for node_key, label in [("kaggle", "Kaggle T4"), ("colab1", "Colab 1"), ("colab2", "Colab 2")]:
+        url = cluster_urls.get(node_key)
+        if url and ping_url(url):
+            if render_motion_gradio(url, image_path, output_video_path):
+                return True, label
+    return False, "Zoom Cinemático (CPU)"
+
+# ==============================================================================
+# 4. GENERACIÓN VISUAL, VOZ, MÚSICA Y MONTAJE
+# ==============================================================================
+
+def generate_image_base(prompt: str, hf_token: str, output_path: str, seed: int = 42):
+    full_prompt = f"{CHARACTER_ANCHOR}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
+    if hf_token:
         try:
-            r = requests.get(sample_url, timeout=10)
-            if r.status_code == 200:
-                with open(sfx_path, "wb") as f:
-                    f.write(r.content)
-            else:
-                sfx_path = None
+            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
+            res = requests.post(api_url, headers=headers, json={"inputs": full_prompt, "parameters": {"seed": seed}}, timeout=40)
+            if res.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(res.content)
+                return True
         except Exception:
-            sfx_path = None
-    return sfx_path
+            pass
+    try:
+        encoded = urllib.parse.quote(full_prompt)
+        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&seed={seed}&nologo=true&model=flux", timeout=40)
+        if r_poll.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(r_poll.content)
+            return True
+    except Exception:
+        pass
+    return False
 
 def get_smart_bgm(mood_tags: str, output_path: str = "/tmp/bgm.mp3"):
     if not DEFAULT_FREESOUND_KEY:
         return None
-    clean_query = mood_tags if mood_tags else "cyberpunk dark synth loop"
-    url = f"https://freesound.org/apiv2/search/text/?query={urllib.parse.quote(clean_query)}&token={DEFAULT_FREESOUND_KEY}&filter=duration:[15+TO+60]&fields=id,name,previews"
+    query = urllib.parse.quote(mood_tags if mood_tags else "anime action epic soundtrack")
+    url = f"https://freesound.org/apiv2/search/text/?query={query}&token={DEFAULT_FREESOUND_KEY}&filter=duration:[25+TO+120]&fields=id,name,previews"
     try:
         res = requests.get(url, timeout=12)
-        if res.status_code == 200:
-            data = res.json()
-            results = data.get("results", [])
-            if results:
-                preview_url = results[0]["previews"]["preview-hq-mp3"]
-                r_audio = requests.get(preview_url, timeout=20)
-                if r_audio.status_code == 200:
-                    with open(output_path, "wb") as f:
-                        f.write(r_audio.content)
-                    return output_path
-    except Exception as e:
-        print(f"Error descargando BGM contextual: {e}")
+        if res.status_code == 200 and res.json().get("results"):
+            preview_url = res.json()["results"][0]["previews"]["preview-hq-mp3"]
+            r_audio = requests.get(preview_url, timeout=20)
+            if r_audio.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(r_audio.content)
+                return output_path
+    except Exception:
+        pass
     return None
 
-async def synthesize_speech_with_subtitles(text: str, voice: str, audio_path: str):
+async def synthesize_speech(text: str, voice: str, audio_path: str):
     communicate = edge_tts.Communicate(text, voice)
     subtitles = []
     with open(audio_path, "wb") as f:
@@ -260,101 +323,28 @@ async def synthesize_speech_with_subtitles(text: str, voice: str, audio_path: st
                 })
     return subtitles
 
-# ==============================================================================
-# 5. GENERACIÓN VISUAL Y CLUSTER SVD (FAILOVER)
-# ==============================================================================
-
-def generate_image_base(prompt: str, hf_token: str, output_path: str, seed: int = 42):
-    full_prompt = f"{CHARACTER_ANCHOR}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
-    if hf_token:
-        try:
-            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
-            payload = {"inputs": full_prompt, "parameters": {"seed": seed, "negative_prompt": "blurry, low quality, distorted, bad anatomy"}}
-            res = requests.post(api_url, headers=headers, json=payload, timeout=40)
-            if res.status_code == 200:
-                with open(output_path, "wb") as f:
-                    f.write(res.content)
-                return True, "Hugging Face"
-        except Exception:
-            pass
-
-    try:
-        encoded_prompt = urllib.parse.quote(full_prompt)
-        poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&seed={seed}&nologo=true&model=flux"
-        r_poll = requests.get(poll_url, timeout=40)
-        if r_poll.status_code == 200:
-            with open(output_path, "wb") as f:
-                f.write(r_poll.content)
-            return True, "Pollinations AI"
-        return False, "Fallo visual"
-    except Exception as ex:
-        return False, str(ex)
-
-def generate_video_with_svd(endpoint_url: str, image_path: str, output_video_path: str):
-    if not GradioClient or not handle_file or not endpoint_url:
-        return False, "Endpoint no disponible"
-    try:
-        client = GradioClient(endpoint_url.strip())
-        result = client.predict(input_img=handle_file(image_path), api_name="/generate_motion")
-        if result and os.path.exists(result):
-            shutil.copy(result, output_video_path)
-            return True, output_video_path
-        return False, "Endpoint no entregó video"
-    except Exception as e:
-        return False, str(e)
-
-def generate_video_cluster(image_path: str, output_video_path: str, preferred_node: str = "Automático (Balanceo / Cascada)"):
-    endpoints = []
-    if preferred_node == "Colab Cuenta 1":
-        endpoints = [("Colab 1", DEFAULT_COLAB_1), ("Kaggle", DEFAULT_KAGGLE), ("Colab 2", DEFAULT_COLAB_2)]
-    elif preferred_node == "Colab Cuenta 2":
-        endpoints = [("Colab 2", DEFAULT_COLAB_2), ("Kaggle", DEFAULT_KAGGLE), ("Colab 1", DEFAULT_COLAB_1)]
-    elif preferred_node == "Kaggle T4 x2":
-        endpoints = [("Kaggle", DEFAULT_KAGGLE), ("Colab 1", DEFAULT_COLAB_1), ("Colab 2", DEFAULT_COLAB_2)]
-    else:
-        endpoints = [("Kaggle", DEFAULT_KAGGLE), ("Colab 1", DEFAULT_COLAB_1), ("Colab 2", DEFAULT_COLAB_2)]
-
-    for name, url in endpoints:
-        if url and ping_gradio_url(url):
-            st.write(f"⚡ Procesando video en nodo: **{name}**...")
-            ok, res = generate_video_with_svd(url, image_path, output_video_path)
-            if ok:
-                return True, name, res
-
-    return False, "Ninguno", "Todos los nodos GPU Gradio están offline."
-
-# ==============================================================================
-# 6. MONTAJE DE ESCENAS Y CONCATENACIÓN MULTI-TOMA
-# ==============================================================================
-
 def overlay_subtitles_on_frame(pil_img, current_text):
     if not current_text:
         return pil_img
     draw = ImageDraw.Draw(pil_img)
     w, h = pil_img.size
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 55)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 52)
     except Exception:
         font = ImageFont.load_default()
-
     bbox = draw.textbbox((0, 0), current_text, font=font)
-    text_w = bbox[2] - bbox[0]
-    x = (w - text_w) // 2
-    y = int(h * 0.78)
-
-    stroke_w = 4
-    for dx in range(-stroke_w, stroke_w + 1):
-        for dy in range(-stroke_w, stroke_w + 1):
+    x = (w - (bbox[2] - bbox[0])) // 2
+    y = int(h * 0.80)
+    for dx in range(-3, 4):
+        for dy in range(-3, 4):
             draw.text((x + dx, y + dy), current_text, font=font, fill=(0, 0, 0))
     draw.text((x, y), current_text, font=font, fill=(255, 235, 59))
     return pil_img
 
-def build_single_scene(visual_path: str, audio_path: str, subtitles: list, output_scene_path: str, is_motion: bool = False):
+def build_scene_clip(visual_path: str, audio_path: str, subtitles: list, out_mp4: str, is_video: bool):
     voice_clip = AudioFileClip(audio_path)
-    dur = voice_clip.duration + 0.2
-
-    if is_motion and VideoFileClip:
+    dur = voice_clip.duration + 0.15
+    if is_video and VideoFileClip:
         base = VideoFileClip(visual_path)
         base = base.loop(duration=dur) if base.duration < dur else base.subclip(0, dur)
         scene = base.fl(lambda gf, t: np.array(overlay_subtitles_on_frame(
@@ -364,286 +354,269 @@ def build_single_scene(visual_path: str, audio_path: str, subtitles: list, outpu
     else:
         target_w, target_h = 1080, 1920
         b_img = Image.open(visual_path).convert("RGB")
-        w, h = b_img.size
-        sc = max(target_w / w, target_h / h)
-        res = b_img.resize((int(w * sc), int(h * sc)), Image.Resampling.LANCZOS)
+        sc = max(target_w / b_img.width, target_h / b_img.height)
+        res = b_img.resize((int(b_img.width * sc), int(b_img.height * sc)), Image.Resampling.LANCZOS)
         l, top = (res.width - target_w) // 2, (res.height - target_h) // 2
         crp = res.crop((l, top, l + target_w, top + target_h))
 
         def frame_zoom(t):
-            zf = 1.0 + 0.04 * (t / max(dur, 1))
+            zf = 1.0 + 0.05 * (t / max(dur, 1))
             zw, zh = int(target_w * zf), int(target_h * zf)
             z_img = crp.resize((zw, zh), Image.Resampling.BILINEAR)
             f_img = z_img.crop(((zw - target_w) // 2, (zh - target_h) // 2, (zw + target_w) // 2, (zh + target_h) // 2))
             active_w = " ".join([s["word"] for s in subtitles if s["start"] <= t <= s["end"] + 0.15]).upper()
             return np.array(overlay_subtitles_on_frame(f_img, active_w))
 
-        clip_img = ImageClip(np.array(crp)).set_duration(dur)
-        scene = clip_img.fl(lambda gf, t: frame_zoom(t))
+        scene = ImageClip(np.array(crp)).set_duration(dur).fl(lambda gf, t: frame_zoom(t))
 
     scene = scene.set_audio(voice_clip)
-    scene.write_videofile(output_scene_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    scene.write_videofile(out_mp4, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     voice_clip.close()
-    return output_scene_path
+    return out_mp4
 
-def assemble_multi_scene_video(scene_paths: list, mood_tags: str, final_output_path: str):
-    clips = [VideoFileClip(p) for p in scene_paths]
-    final_video = concatenate_videoclips(clips, method="compose")
-    total_duration = final_video.duration
+def analyze_manga_page_with_gemini(image_path: str, previous_page_context: str):
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    tracks = [final_video.audio]
-
-    sfx_p = get_action_sfx()
-    if sfx_p and os.path.exists(sfx_p):
-        try:
-            sfx = AudioFileClip(sfx_p).volumex(0.3).subclip(0, min(1.2, total_duration)).set_start(0.1)
-            tracks.append(sfx)
-        except Exception:
-            pass
-
-    bgm_p = get_smart_bgm(mood_tags)
-    if bgm_p and os.path.exists(bgm_p):
-        try:
-            bgm = AudioFileClip(bgm_p).volumex(0.14)
-            bgm = bgm.loop(duration=total_duration) if bgm.duration < total_duration else bgm.subclip(0, total_duration)
-            tracks.append(bgm)
-        except Exception:
-            pass
-
-    final_audio = CompositeAudioClip(tracks)
-    final_video = final_video.set_audio(final_audio)
-    final_video.write_videofile(final_output_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
-
-    for c in clips:
-        c.close()
-    return final_output_path
-
-# ==============================================================================
-# 7. PUBLICACIÓN A TIKTOK INBOX (V2)
-# ==============================================================================
-
-def renew_tiktok_token():
-    url = "https://open.tiktokapis.com/v2/oauth/token/"
-    payload = {
-        "client_key": DEFAULT_CLIENT_KEY,
-        "client_secret": DEFAULT_CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": st.session_state["tiktok_refresh_token"],
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    prompt = f"""
+    Eres un narrador de resúmenes de Manga/Manhwa estilo Anime Recap.
+    Contexto de la página anterior (no repitas esto, continúa la acción): '{previous_page_context}'.
+    Lee los globos de texto de esta imagen y crea una narración fluida y atrapante en español (máximo 25 palabras).
+    Responde SOLO en JSON:
+    {{"narration": "Texto narrado", "music_mood": "tags en inglés"}}
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
+    payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}]}]}
     try:
-        res = requests.post(url, headers=headers, data=payload, timeout=20)
-        data = res.json()
-        if "access_token" in data:
-            st.session_state["tiktok_access_token"] = data["access_token"]
-            return data["access_token"]
+        res = requests.post(url, json=payload, timeout=25)
+        txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
     except Exception:
-        pass
-    return None
-
-def upload_video_to_tiktok(video_path: str):
-    if not os.path.exists(video_path):
-        raise FileNotFoundError("Video no encontrado.")
-    file_size = os.path.getsize(video_path)
-    access_token = st.session_state["tiktok_access_token"]
-
-    def _init(token):
-        url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
-        h = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8"}
-        b = {"source_info": {"source": "FILE_UPLOAD", "video_size": file_size, "chunk_size": file_size, "total_chunk_count": 1}}
-        return requests.post(url, headers=h, json=b, timeout=30)
-
-    res_init = _init(access_token)
-    init_data = res_init.json()
-
-    if init_data.get("error", {}).get("code") in ["access_token_invalid", "token_expired", "invalid_token"]:
-        access_token = renew_tiktok_token()
-        res_init = _init(access_token)
-        init_data = res_init.json()
-
-    if init_data.get("error", {}).get("code") != "ok":
-        raise Exception(f"Fallo TikTok API: {init_data}")
-
-    upload_url = init_data["data"]["upload_url"]
-    publish_id = init_data["data"]["publish_id"]
-
-    headers = {"Content-Type": "video/mp4", "Content-Range": f"bytes 0-{file_size - 1}/{file_size}"}
-    with open(video_path, "rb") as vf:
-        requests.put(upload_url, headers=headers, data=vf, timeout=120)
-
-    return publish_id
+        return {"narration": "El combate entra en su fase más crítica mientras los poderes chocan.", "music_mood": "anime dramatic battle"}
 
 # ==============================================================================
-# 8. INTERFAZ STREAMLIT
+# 5. INTERFAZ STREAMLIT
 # ==============================================================================
 
-st.sidebar.title("⚡ Estado del Sistema")
+cluster_urls = get_dynamic_cluster_urls()
 
-# Estado de Gemini sin operador ternario que genere DeltaGenerator
-if DEFAULT_GEMINI_KEY:
-    ok_gem, msg_gem = verify_gemini_api_key(DEFAULT_GEMINI_KEY)
-    if ok_gem:
-        st.sidebar.success(f"✅ {msg_gem}")
-    else:
-        st.sidebar.error(f"❌ {msg_gem}")
+st.sidebar.title("⚡ Cluster GPU & Control")
+if cluster_urls.get("modal"):
+    st.sidebar.success("🚀 Modal Labs: Activo (24/7)")
 else:
-    st.sidebar.warning("⚠️ Falta Gemini API Key en Secrets")
+    st.sidebar.warning("⚠️ Modal Labs: Sin URL en Secrets")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Estado del Cluster GPU Gratuito:**")
-ok_kg = ping_gradio_url(DEFAULT_KAGGLE)
-ok_c1 = ping_gradio_url(DEFAULT_COLAB_1)
-ok_c2 = ping_gradio_url(DEFAULT_COLAB_2)
+st.sidebar.markdown("**Respaldo GPU (Auto-Sync URLs):**")
 
-st.sidebar.markdown(f"• **Kaggle T4 x2:** {'🟢 Online' if ok_kg else '🔴 Offline'}")
-st.sidebar.markdown(f"• **Colab Cuenta 1:** {'🟢 Online' if ok_c1 else '🔴 Offline'}")
-st.sidebar.markdown(f"• **Colab Cuenta 2:** {'🟢 Online' if ok_c2 else '🔴 Offline'}")
+c1, c2 = st.sidebar.columns([2, 1])
+c1.markdown(f"**Kaggle:** {'🟢 Online' if ping_url(cluster_urls.get('kaggle')) else '🔴 Offline'}")
+c2.link_button("Abrir", NOTEBOOK_KAGGLE)
 
-st.sidebar.markdown("---")
-if DEFAULT_FREESOUND_KEY:
-    st.sidebar.success("✅ Freesound BGM Vinculado")
+c3, c4 = st.sidebar.columns([2, 1])
+c3.markdown(f"**Colab 1:** {'🟢 Online' if ping_url(cluster_urls.get('colab1')) else '🔴 Offline'}")
+c4.link_button("Abrir", NOTEBOOK_COLAB1)
 
-# Verificación de conexión REST a Supabase
-sb_ok, sb_msg = test_supabase_connection()
-if sb_ok:
-    st.sidebar.success("✅ Supabase DB Activa")
-else:
-    st.sidebar.warning(f"⚠️ Sin conexión a Supabase: {sb_msg}")
+c5, c6 = st.sidebar.columns([2, 1])
+c5.markdown(f"**Colab 2:** {'🟢 Online' if ping_url(cluster_urls.get('colab2')) else '🔴 Offline'}")
+c6.link_button("Abrir", NOTEBOOK_COLAB2)
 
-if DEFAULT_TG_TOKEN and DEFAULT_TG_CHAT:
-    st.sidebar.success("✅ Telegram Bot Activo")
+if st.sidebar.button("🔄 Refrescar Estado Cluster"):
+    st.rerun()
 
-if st.session_state["tiktok_access_token"]:
-    st.sidebar.success("✅ TikTok Sandbox Vinculado")
+st.title("🎬 Manga Studio AI: Continuidad & PDF-to-Anime")
 
-st.title("🎬 Manga Studio: Multi-Escena con Triple GPU Cluster")
+tabs = st.tabs([
+    "🚀 Serie Original (Continuidad)",
+    "📚 Manga PDF a Clips (1 Min)",
+    "✨ Generador de Guiones IA",
+    "📑 Historial en Supabase"
+])
 
-tabs = st.tabs(["🚀 Productor Multi-Toma", "📑 Base de Datos", "📤 Publicación TikTok"])
-
+# ------------------------------------------------------------------------------
+# PESTAÑA 1: SERIE ORIGINAL CON CONTINUIDAD ESTRICTA (CERO REPETICIONES)
+# ------------------------------------------------------------------------------
 with tabs[0]:
-    next_chapter = get_current_episode_number()
-    st.subheader(f"Capítulo #{next_chapter}: Guion Estructurado en 3 Tomas")
+    series_name = st.text_input("Nombre de la Serie:", value="Jun-woo: Neo-Seúl")
+    next_chap, prev_summary = get_series_continuity(series_name)
+
+    st.subheader(f"Capítulo #{next_chap} (Continuación Automática)")
+    st.info(f"📖 **Contexto del capítulo anterior (para evitar repetir):** {prev_summary}")
 
     premise_input = st.text_area(
-        "Premisa Principal:",
-        value=f"Capítulo {next_chapter}: Jun-woo enfrenta a los asesinos cibernéticos en el callejón de Neo-Seúl.",
+        "Dirección para este capítulo:",
+        value=f"Continúa la historia tras '{prev_summary}'. Jun-woo enfrenta un nuevo peligro en Neo-Seúl.",
         height=70
     )
+    col_v, col_tk = st.columns(2)
+    voice_sel = col_v.selectbox("Voz:", ["es-MX-JorgeNeural", "es-ES-AlvaroNeural"])
+    auto_tiktok = col_tk.checkbox("Subir automáticamente a bandeja de TikTok", value=False)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        voice_sel = st.selectbox("Voz de la serie:", ["es-MX-JorgeNeural", "es-ES-AlvaroNeural"])
-    with col2:
-        engine_mode = st.selectbox("Motor de Video:", ["Cluster GPU (Automático)", "Kaggle T4 x2", "Colab Cuenta 1", "Colab Cuenta 2", "Zoom Cinemático (CPU)"])
-
-    if st.button("🔥 Generar Capítulo Completo", type="primary"):
+    if st.button(f"🔥 Generar Capítulo #{next_chap} y Avanzar Historia", type="primary"):
         if not DEFAULT_GEMINI_KEY:
-            st.error("Gemini API Key requerida en Secrets.")
+            st.error("Falta Gemini API Key.")
         else:
-            with st.status("Produciendo historia de 3 escenas...", expanded=True) as status:
-                st.write("🧠 1. Desglosando guion y mood musical con Gemini...")
+            with st.status(f"Produciendo Capítulo #{next_chap}...", expanded=True) as status:
                 gem_prompt = f"""
-                Eres un director de Manhwas de acción. Genera un guion en 3 escenas secuenciales para TikTok basado en: '{premise_input}'.
+                Eres el director de '{series_name}'. Escribe el CAPÍTULO #{next_chap} en 3 escenas consecutivas.
+                LO QUE YA PASÓ ANTES (NO REPETIR): '{prev_summary}'.
+                NUEVA DIRECCIÓN: '{premise_input}'.
                 Responde en JSON ESTRICTO:
                 {{
-                  "title": "Título con emojis",
-                  "description": "Texto suspenso",
+                  "title": "Cap. {next_chap}: Título",
+                  "description": "Resumen de lo ocurrido en este capítulo para continuar en el siguiente",
                   "hashtags": "#manhwa #cyberpunk #action",
                   "mood_music": "cyberpunk dark synth fast",
                   "scenes": [
-                    {{"prompt": "Jun-woo looking at scanner in dark neon alley", "narration": "Detecté su rastro en el sector cuatro."}},
-                    {{"prompt": "Jun-woo drawing energy blade with glowing blue eye", "narration": "No vinieron a negociar."}},
-                    {{"prompt": "Jun-woo surrounded by shadows looking at camera", "narration": "El verdadero juego acaba de empezar."}}
+                    {{"prompt": "Scene 1 visual prompt in English", "narration": "Narración 1"}},
+                    {{"prompt": "Scene 2 visual prompt in English", "narration": "Narración 2"}},
+                    {{"prompt": "Scene 3 visual prompt in English", "narration": "Narración 3"}}
                   ]
                 }}
                 """
                 url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
-                res_g = requests.post(url_g, headers={"Content-Type": "application/json"}, json={"contents": [{"parts": [{"text": gem_prompt}]}]}, timeout=30)
-                
-                try:
-                    txt = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    clean_json = re.search(r"\{.*\}", txt, re.DOTALL).group(0)
-                    script_data = json.loads(clean_json)
-                except Exception:
-                    script_data = {
-                        "title": f"Capítulo {next_chapter}: Emboscada Neón",
-                        "description": "La trampa fue tendida.",
-                        "hashtags": "#manhwa #cyberpunk #action",
-                        "mood_music": "cyberpunk action synth",
-                        "scenes": [
-                            {"prompt": "Jun-woo scanning shadows", "narration": "Están cerca."},
-                            {"prompt": "Jun-woo activating cyan cybernetic eye", "narration": "No pienso retroceder."},
-                            {"prompt": "Jun-woo smiling ready for combat", "narration": "Que vengan todos."}
-                        ]
-                    }
+                res_g = requests.post(url_g, json={"contents": [{"parts": [{"text": gem_prompt}]}]}, timeout=30)
+                txt = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
+                script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
-                title = script_data.get("title")
-                desc = script_data.get("description")
-                tags = script_data.get("hashtags")
-                mood = script_data.get("mood_music")
-                scenes = script_data.get("scenes", [])
+                title = script_data["title"]
+                desc = script_data["description"]
+                tags = script_data["hashtags"]
+                mood = script_data["mood_music"]
+                scenes = script_data["scenes"]
 
-                ep_id = save_episode_to_supabase(next_chapter, title, desc, tags, scenes[0]["prompt"], scenes[0]["narration"], "processing")
+                ep_id = save_episode_to_supabase(series_name, next_chap, title, desc, tags, scenes[0]["prompt"], scenes[0]["narration"], "processing")
 
-                rendered_scene_files = []
-                all_gpu_offline = True
-
+                rendered_files = []
                 for idx, sc in enumerate(scenes):
-                    st.write(f"🎬 Renderizando Escena {idx+1}/{len(scenes)}: {sc['narration']}")
-                    img_f = f"/tmp/scene_{idx}.png"
-                    aud_f = f"/tmp/scene_{idx}.mp3"
-                    scene_v_out = f"/tmp/scene_{idx}.mp4"
+                    st.write(f"🎬 Escena {idx+1}/3: {sc['narration']}")
+                    img_f = f"/tmp/s1_{idx}.png"
+                    aud_f = f"/tmp/s1_{idx}.mp3"
+                    mp4_f = f"/tmp/s1_{idx}.mp4"
+                    anim_f = f"/tmp/a1_{idx}.mp4"
 
-                    generate_image_base(sc["prompt"], DEFAULT_HF_TOKEN, img_f, seed=42 + idx)
-                    subs = asyncio.run(synthesize_speech_with_subtitles(sc["narration"], voice_sel, aud_f))
+                    generate_image_base(sc["prompt"], DEFAULT_HF_TOKEN, img_f, seed=next_chap * 10 + idx)
+                    subs = asyncio.run(synthesize_speech(sc["narration"], voice_sel, aud_f))
+                    ok_anim, engine = animate_image_cascade(img_f, anim_f, cluster_urls)
+                    st.write(f"   ↳ Motor utilizado: **{engine}**")
+                    build_scene_clip(anim_f if ok_anim else img_f, aud_f, subs, mp4_f, is_video=ok_anim)
+                    rendered_files.append(mp4_f)
 
-                    is_motion = False
-                    anim_f = f"/tmp/anim_{idx}.mp4"
+                clips = [VideoFileClip(p) for p in rendered_files]
+                final_vid = concatenate_videoclips(clips, method="compose")
+                bgm_p = get_smart_bgm(mood)
+                if bgm_p and os.path.exists(bgm_p):
+                    bgm = AudioFileClip(bgm_p).volumex(0.14)
+                    bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
+                    final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
 
-                    if engine_mode != "Zoom Cinemático (CPU)":
-                        ok_v, node_used, _ = generate_video_cluster(img_f, anim_f, preferred_node=engine_mode)
-                        if ok_v:
-                            img_f = anim_f
-                            is_motion = True
-                            all_gpu_offline = False
+                out_final = f"/tmp/cap_{next_chap}_final.mp4"
+                final_vid.write_videofile(out_final, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+                for c in clips:
+                    c.close()
 
-                    build_single_scene(img_f, aud_f, subs, scene_v_out, is_motion=is_motion)
-                    rendered_scene_files.append(scene_v_out)
+                update_series_progress(series_name, next_chap, desc)
+                send_telegram_with_approval(DEFAULT_TG_TOKEN, DEFAULT_TG_CHAT, f"🎬 **{title}**\n{desc}\n{tags}", out_final, ep_id)
+                if auto_tiktok:
+                    ok_tk, msg_tk = upload_video_to_tiktok(out_final, f"{title} {tags}")
+                    st.write(f"📱 TikTok: {msg_tk}")
 
-                if engine_mode != "Zoom Cinemático (CPU)" and all_gpu_offline:
-                    save_episode_to_supabase(next_chapter, title, desc, tags, scenes[0]["prompt"], scenes[0]["narration"], "queued_retry")
-                    st.warning("⚠️ Nodos GPU fuera de línea. Tarea registrada en cola de reintentos.")
+                status.update(label=f"¡Capítulo #{next_chap} listo! El siguiente será el #{next_chap + 1}.", state="complete")
+                st.video(out_final)
 
-                st.write("🎞️ Ensamblando las 3 escenas con BGM dinámico de Freesound...")
-                final_movie = f"/tmp/capitulo_{next_chapter}_final.mp4"
-                assemble_multi_scene_video(rendered_scene_files, mood, final_movie)
-
-                status.update(label="¡Capítulo Multi-Escena completado!", state="complete")
-                st.session_state["latest_video_path"] = final_movie
-                st.video(final_movie)
-
-                if DEFAULT_TG_TOKEN and DEFAULT_TG_CHAT:
-                    tg_msg = f"🎬 **{title}**\n\n{desc}\n\n{tags}"
-                    send_telegram_with_approval(DEFAULT_TG_TOKEN, DEFAULT_TG_CHAT, tg_msg, final_movie, ep_id)
-                    st.success("📲 Video enviado a Telegram con botones de publicación.")
-
+# ------------------------------------------------------------------------------
+# PESTAÑA 2: SUBIR PDF DE MANGA -> CLIPS DE 1 MINUTO CON GUION Y MÚSICA
+# ------------------------------------------------------------------------------
 with tabs[1]:
-    st.subheader("Estado de Episodios en Supabase")
-    records = fetch_all_episodes()
-    if records:
-        st.dataframe(records, use_container_width=True)
-    else:
-        st.info("Sin registros cargados aún.")
+    st.subheader("📚 Convertir PDF de Manga en Clips de 1 Minuto")
+    uploaded_pdf = st.file_uploader("Sube tu archivo Manga (.pdf)", type=["pdf"])
+    manga_series = st.text_input("Nombre del Manga (para llevar control de partes):", value="Manga PDF Viral")
+    next_part_start, prev_manga_ctx = get_series_continuity(manga_series)
+    st.caption(f"Continuará a partir de la **Parte #{next_part_start}**.")
 
+    if uploaded_pdf and st.button("🎬 Animar PDF y Cortar en Clips de 1 Minuto", type="primary"):
+        if fitz and DEFAULT_GEMINI_KEY:
+            with st.status("Procesando páginas del manga...", expanded=True) as status:
+                doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+                page_clips = []
+                running_ctx = prev_manga_ctx
+                mood_bgm = "anime epic battle"
+
+                for i in range(len(doc)):
+                    st.write(f"📖 Página {i+1}/{len(doc)}...")
+                    pix = doc.load_page(i).get_pixmap(dpi=150)
+                    img_p = f"/tmp/pdf_p_{i}.jpg"
+                    pix.save(img_p)
+
+                    v_data = analyze_manga_page_with_gemini(img_p, running_ctx)
+                    narr = v_data.get("narration", "")
+                    running_ctx = narr
+                    if i == 0:
+                        mood_bgm = v_data.get("music_mood", mood_bgm)
+
+                    aud_p = f"/tmp/pdf_a_{i}.mp3"
+                    subs = asyncio.run(synthesize_speech(narr, "es-MX-JorgeNeural", aud_p))
+                    anim_p = f"/tmp/pdf_anim_{i}.mp4"
+                    ok_a, _ = animate_image_cascade(img_p, anim_p, cluster_urls)
+                    clip_p = f"/tmp/pdf_c_{i}.mp4"
+                    build_scene_clip(anim_p if ok_a else img_p, aud_p, subs, clip_p, is_video=ok_a)
+                    c_obj = VideoFileClip(clip_p)
+                    page_clips.append((clip_p, c_obj.duration))
+                    c_obj.close()
+
+                parts = []
+                batch, dur_acc = [], 0.0
+                for cp, d in page_clips:
+                    batch.append(cp)
+                    dur_acc += d
+                    if dur_acc >= 55.0:
+                        parts.append(batch)
+                        batch, dur_acc = [], 0.0
+                if batch:
+                    parts.append(batch)
+
+                bgm_f = get_smart_bgm(mood_bgm)
+                current_p_num = next_part_start
+
+                for b_files in parts:
+                    s_clips = [VideoFileClip(f) for f in b_files]
+                    concat = concatenate_videoclips(s_clips, method="compose")
+                    if bgm_f and os.path.exists(bgm_f):
+                        bgm = AudioFileClip(bgm_f).volumex(0.14)
+                        bgm = bgm.loop(duration=concat.duration) if bgm.duration < concat.duration else bgm.subclip(0, concat.duration)
+                        concat = concat.set_audio(CompositeAudioClip([concat.audio, bgm]))
+
+                    final_p = f"/tmp/manga_parte_{current_p_num}.mp4"
+                    concat.write_videofile(final_p, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+                    for c in s_clips:
+                        c.close()
+
+                    cap_txt = f"🔥 **{manga_series} - Parte {current_p_num}**\n¡Sigue para la siguiente parte! #manga #anime"
+                    ep_id = save_episode_to_supabase(manga_series, current_p_num, f"{manga_series} Pt.{current_p_num}", running_ctx, "#manga #anime", "PDF", running_ctx, "ready")
+                    update_series_progress(manga_series, current_p_num, running_ctx)
+                    send_telegram_with_approval(DEFAULT_TG_TOKEN, DEFAULT_TG_CHAT, cap_txt, final_p, ep_id)
+                    st.video(final_p)
+                    current_p_num += 1
+
+                status.update(label="¡Clips de 1 minuto generados y guardados en continuidad!", state="complete")
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 3: GENERADOR DE GUIONES IA
+# ------------------------------------------------------------------------------
 with tabs[2]:
-    st.subheader("Publicación Inmediata a TikTok")
-    if "latest_video_path" in st.session_state and os.path.exists(st.session_state["latest_video_path"]):
-        st.video(st.session_state["latest_video_path"])
-        if st.button("📤 Subir a TikTok Inbox"):
-            try:
-                pid = upload_video_to_tiktok(st.session_state["latest_video_path"])
-                st.success(f"¡Subido exitosamente! Publish ID: `{pid}`")
-            except Exception as e:
-                st.error(f"Error al subir: {e}")
-    else:
-        st.info("Genera un video en la Pestaña 1 primero.")
+    st.subheader("✨ Generador de Ideas y Guiones por Temporada")
+    idea = st.text_area("Escribe la premisa base de tu nueva historia:")
+    if st.button("🧠 Crear Guion de 3 Capítulos"):
+        if DEFAULT_GEMINI_KEY and idea:
+            url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
+            res = requests.post(url_g, json={"contents": [{"parts": [{"text": f"Crea una escaleta de 3 capítulos conectados con cliffhangers basada en: {idea}"}]}]}, timeout=25)
+            st.markdown(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 4: HISTORIAL Y CONTINUIDAD EN SUPABASE
+# ------------------------------------------------------------------------------
+with tabs[3]:
+    st.subheader("📑 Registro de Capítulos Producidos")
+    recs = fetch_recent_episodes()
+    if recs:
+        st.dataframe(recs, use_container_width=True)
