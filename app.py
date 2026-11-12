@@ -15,10 +15,12 @@ from studio_engine import (
     update_series_progress,
     save_episode_to_supabase,
     animate_image_cascade,
-    get_smart_bgm,
+    get_freesound_audio,
     build_scene_clip,
     synthesize_multivoice_speech,
-    produce_series_episode
+    produce_series_episode,
+    generate_character_portrait,
+    upload_to_supabase_storage
 )
 
 try:
@@ -80,14 +82,23 @@ ENGINE_CONFIG = {
 }
 
 DEFAULT_ACCESS_TOKEN = get_secret("tiktok", "access_token", "")
+YT_REFRESH_TOKEN = get_secret("youtube", "refresh_token", "")
 NOTEBOOK_KAGGLE = get_secret("notebooks", "kaggle_url", "https://www.kaggle.com/code")
 NOTEBOOK_COLAB1 = get_secret("notebooks", "colab1_url", "https://colab.research.google.com/")
 NOTEBOOK_COLAB2 = get_secret("notebooks", "colab2_url", "https://colab.research.google.com/")
 
-def save_script_to_db(title: str, premise: str, char_prompt: str, script_content: str):
+def save_script_with_portrait(title: str, premise: str, char_prompt: str, script_content: str):
     sb_url, sb_key = ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"]
     if not sb_url or not sb_key or not title.strip():
         return False
+
+    # Generar retrato oficial del protagonista y subirlo a Supabase Storage
+    ref_url = ""
+    portrait_file = generate_character_portrait(char_prompt, ENGINE_CONFIG["hf_token"])
+    if portrait_file:
+        safe_t = re.sub(r"[^a-zA-Z0-9_-]", "_", title.strip())
+        ref_url = upload_to_supabase_storage(sb_url, sb_key, portrait_file, f"portraits/{safe_t}.png", "image/png")
+
     url = f"{sb_url.rstrip('/')}/rest/v1/saved_scripts"
     headers = get_sb_headers(sb_key)
     headers["Prefer"] = "resolution=merge-duplicates"
@@ -95,10 +106,11 @@ def save_script_to_db(title: str, premise: str, char_prompt: str, script_content
         "title": title.strip(),
         "premise": premise.strip(),
         "character_prompt": char_prompt.strip(),
+        "reference_image_url": ref_url,
         "script_content": script_content
     }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=8)
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
         return r.status_code in [200, 201]
     except Exception:
         return False
@@ -123,14 +135,14 @@ def fetch_recent_episodes():
     except Exception:
         return []
 
-def send_remote_telegram_command(series_name: str):
+def send_remote_telegram_command(cmd_text: str):
     tg_token, tg_chat = ENGINE_CONFIG["tg_token"], ENGINE_CONFIG["tg_chat"]
     if not tg_token or not tg_chat:
         return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{tg_token}/sendMessage",
-            json={"chat_id": tg_chat, "text": f"/producir {series_name}"},
+            json={"chat_id": tg_chat, "text": cmd_text},
             timeout=10
         )
         return r.status_code == 200
@@ -170,20 +182,21 @@ with st.sidebar:
         <div>🗄️ <b>Supabase BD:</b> {'🟢 Conectado' if ENGINE_CONFIG['sb_url'] else '🔴 Offline'}</div>
         <div>🧠 <b>Gemini AI:</b> {'🟢 Listo' if ENGINE_CONFIG['gemini_key'] else '🔴 Sin Key'}</div>
         <div>🎨 <b>Hugging Face:</b> {'🟢 Listo' if ENGINE_CONFIG['hf_token'] else '🟡 Pollinations'}</div>
-        <div>🎵 <b>Freesound BGM:</b> {'🟢 Listo' if ENGINE_CONFIG['fs_key'] else '🔴 Sin Key'}</div>
+        <div>🎵 <b>Freesound SFX/BGM:</b> {'🟢 Listo' if ENGINE_CONFIG['fs_key'] else '🔴 Sin Key'}</div>
         <div>✈️ <b>Telegram Bot:</b> {'🟢 Conectado' if ENGINE_CONFIG['tg_token'] else '🔴 Sin Token'}</div>
         <div>📱 <b>TikTok API:</b> {'🟢 Token Activo' if DEFAULT_ACCESS_TOKEN else '🔴 Sin Token'}</div>
+        <div>▶️ <b>YouTube Shorts:</b> {'🟢 Conectado' if YT_REFRESH_TOKEN else '🟡 Opcional'}</div>
     </div>
     """, unsafe_allow_html=True)
 
 # ==============================================================================
-# INTERFAZ PRINCIPAL
+# ENCABEZADO Y PESTAÑAS
 # ==============================================================================
 
 st.markdown("""
 <div class="main-header">
-    <h1>🎬 Manga Studio AI — Pro Edition</h1>
-    <p>Doblaje Multi-Voz por personaje • Subtítulos dinámicos estilo TikTok • Consistencia visual • Renderizado 24/7 en segundo plano</p>
+    <h1>🎬 Manga Studio AI — Ultimate Edition</h1>
+    <p>Memoria Visual (Retrato Fijo) • SFX de Acción • Hook Viral • Doblaje Multi-Voz • Publicación Directa en TikTok y YouTube Shorts</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -192,13 +205,13 @@ recent_eps_list = fetch_recent_episodes()
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Motor Principal", "Modal T4 24/7")
-m2.metric("Guiones Guardados", len(saved_scripts_list))
+m2.metric("Series Guardadas", len(saved_scripts_list))
 m3.metric("Episodios Producidos", len(recent_eps_list))
-m4.metric("Doblaje y Subtítulos", "Multi-Voz + CapCut")
+m4.metric("Audio y Efectos", "Multi-Voz + SFX")
 
 tabs = st.tabs([
-    "🚀 Producción de Series (Multi-Voz)",
-    "✨ Biblioteca y Creador de Guiones",
+    "🚀 Producción de Series",
+    "✨ Biblioteca y Retrato de Personaje",
     "📚 Manga PDF a Clips (1 Min)",
     "📑 Historial de Producción"
 ])
@@ -207,7 +220,7 @@ tabs = st.tabs([
 # PESTAÑA 1: PRODUCCIÓN DE SERIES
 # ------------------------------------------------------------------------------
 with tabs[0]:
-    col_l, col_r = st.columns([1.1, 1])
+    col_l, col_r = st.columns([1.15, 1])
 
     with col_l:
         st.subheader("1️⃣ Selección de Serie Guardada")
@@ -223,26 +236,32 @@ with tabs[0]:
 
         next_chap, prev_summary = get_series_continuity(ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"], series_name)
         char_desc = sel_script.get("character_prompt") if sel_script and sel_script.get("character_prompt") else "Jun-woo, 24yo korean soldier, glowing cyan eye, black tactical jacket"
+        ref_portrait = sel_script.get("reference_image_url", "") if sel_script else ""
 
-        st.markdown(f"""
-        <div class="script-box">
-            <b>📌 Serie:</b> {series_name}  |  <b>🎬 Próximo:</b> Capítulo #{next_chap}<br>
-            <small style="color:#a5b4fc;"><b>🧬 Ficha Visual Fija:</b> {char_desc}</small><br>
-            <small style="color:#b8c0e0;"><b>📖 Último evento (no repetir):</b> {prev_summary}</small>
-        </div>
-        """, unsafe_allow_html=True)
+        c_info, c_img = st.columns([2, 1])
+        with c_info:
+            st.markdown(f"""
+            <div class="script-box">
+                <b>📌 Serie:</b> {series_name}  |  <b>🎬 Próximo:</b> Cap. #{next_chap}<br>
+                <small style="color:#a5b4fc;"><b>🧬 Ficha Visual:</b> {char_desc}</small><br>
+                <small style="color:#b8c0e0;"><b>📖 Último evento:</b> {prev_summary}</small>
+            </div>
+            """, unsafe_allow_html=True)
+        with c_img:
+            if ref_portrait:
+                st.image(ref_portrait, caption="Retrato Fijo", use_container_width=True)
 
     with col_r:
-        st.subheader("2️⃣ Renderizado Directo o en Segundo Plano")
+        st.subheader("2️⃣ Renderizado Directo o Piloto Automático")
         premise_input = st.text_area(
             "Dirección del capítulo:",
             value=f"Continúa la trama de '{series_name}' después de: '{prev_summary}'.",
-            height=95
+            height=90
         )
 
         b1, b2 = st.columns(2)
         if b1.button(f"🔥 Producir Aquí (Cap. #{next_chap})", type="primary", use_container_width=True):
-            with st.status(f"Produciendo Capítulo #{next_chap} (Multi-Voz + Subtítulos TikTok)...", expanded=True) as status:
+            with st.status(f"Produciendo Capítulo #{next_chap} (SFX + Hook + Multi-Voz)...", expanded=True) as status:
                 out_vid, title, _ = produce_series_episode(
                     series_name=series_name,
                     custom_direction=premise_input,
@@ -252,23 +271,27 @@ with tabs[0]:
                 status.update(label=f"✅ ¡{title} completado y enviado a Telegram!", state="complete")
                 st.video(out_vid)
 
-        if b2.button("☁️ Enviar a Segundo Plano (Telegram/Render)", use_container_width=True):
-            if send_remote_telegram_command(series_name):
-                st.success(f"🚀 Orden enviada. Ya puedes cerrar esta pestaña; tu bot de Telegram te avisará cuando el Capítulo #{next_chap} esté listo.")
+        if b2.button("☁️ Producir en Segundo Plano (Render)", use_container_width=True):
+            if send_remote_telegram_command(f"/producir {series_name}"):
+                st.success("🚀 Orden enviada a Render. Puedes cerrar esta pestaña; tu bot te enviará el video listo.")
             else:
-                st.info(f"💡 Envía el mensaje `/producir {series_name}` directamente a tu bot en Telegram para que Render lo fabrique en segundo plano.")
+                st.info(f"💡 Envía `/producir {series_name}` en tu chat de Telegram.")
+
+        if st.button("🤖 Ejecutar Ronda Completa de TODAS las Series Guardadas", use_container_width=True):
+            send_remote_telegram_command("/producir_todas")
+            st.success("🚀 Ronda multi-serie activada en segundo plano.")
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 2: BIBLIOTECA Y CREADOR DE GUIONES CON FICHA VISUAL
+# PESTAÑA 2: BIBLIOTECA Y RETRATO OFICIAL DE PERSONAJE
 # ------------------------------------------------------------------------------
 with tabs[1]:
     col_gen, col_lib = st.columns([1.1, 1])
 
     with col_gen:
-        st.subheader("✍️ Crear Guion con Ficha Visual Fija")
+        st.subheader("✍️ Crear Guion y Retrato Oficial del Protagonista")
         new_title = st.text_input("Título Identificador de la Serie:", placeholder="Ej: El Heredero de las Sombras")
         char_visual = st.text_input(
-            "🧬 Ficha Visual del Protagonista (en inglés, se usará en TODOS los capítulos):",
+            "🧬 Ficha Visual del Protagonista (en inglés):",
             value="20yo anime boy, messy silver hair, glowing violet eyes, dark hooded trench coat, katana on back"
         )
         num_caps = st.slider("Capítulos a planificar:", 3, 10, 5)
@@ -288,18 +311,21 @@ with tabs[1]:
         if "draft_script" in st.session_state:
             ed_title = st.text_input("Confirma Título:", value=st.session_state.get("draft_title", ""))
             ed_char = st.text_input("Confirma Ficha Visual:", value=st.session_state.get("draft_char", ""))
-            ed_script = st.text_area("Guion:", value=st.session_state["draft_script"], height=220)
-            if st.button("💾 Guardar Guion y Ficha Visual en Supabase", use_container_width=True):
-                if save_script_to_db(ed_title, st.session_state.get("draft_premise", ""), ed_char, ed_script):
-                    st.success(f"✅ '{ed_title}' guardado con consistencia visual.")
-                    time.sleep(1)
-                    st.rerun()
+            ed_script = st.text_area("Guion:", value=st.session_state["draft_script"], height=200)
+            if st.button("💾 Guardar Guion y Generar Retrato Oficial del Héroe", use_container_width=True):
+                with st.spinner("Generando retrato fijo del protagonista y guardando en Supabase..."):
+                    if save_script_with_portrait(ed_title, st.session_state.get("draft_premise", ""), ed_char, ed_script):
+                        st.success(f"✅ '{ed_title}' guardado con su retrato oficial para consistencia visual.")
+                        time.sleep(1)
+                        st.rerun()
 
     with col_lib:
-        st.subheader("📚 Guiones Guardados")
+        st.subheader("📚 Series Guardadas en Biblioteca")
         for item in saved_scripts_list:
             c_next, l_sum = get_series_continuity(ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"], item["title"])
             with st.expander(f"🎬 {item['title']} (Va en el Cap. #{c_next})"):
+                if item.get("reference_image_url"):
+                    st.image(item["reference_image_url"], width=160)
                 st.caption(f"**Ficha Visual:** {item.get('character_prompt', '')}")
                 st.caption(f"**Último avance:** {l_sum}")
                 st.markdown(item["script_content"])
@@ -314,7 +340,7 @@ with tabs[2]:
     next_p, prev_m_ctx = get_series_continuity(ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"], manga_series)
     st.caption(f"Continuará desde la **Parte #{next_p}**.")
 
-    if uploaded_pdf and st.button("🎬 Animar PDF (Multi-Voz + Subtítulos TikTok)", type="primary"):
+    if uploaded_pdf and st.button("🎬 Animar PDF (SFX + Multi-Voz + Subtítulos TikTok)", type="primary"):
         if fitz and ENGINE_CONFIG["gemini_key"]:
             with st.status("Procesando páginas del manga...", expanded=True) as status:
                 doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
@@ -330,7 +356,7 @@ with tabs[2]:
 
                     with open(img_p, "rb") as f:
                         img_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    p_gem = f"Contexto previo (no repetir): '{running_ctx}'. Lee esta página de manga y devuelve JSON con diálogos por rol (NARRADOR, PROTAGONISTA, CHICA, VILLANO): {{\"dialogues\": [{{\"role\": \"NARRADOR\", \"text\": \"...\"}}], \"music_mood\": \"anime battle\"}}"
+                    p_gem = f"Contexto previo (no repetir): '{running_ctx}'. Lee esta página de manga y devuelve JSON con diálogos por rol (NARRADOR, PROTAGONISTA, CHICA, VILLANO) y sfx_query: {{\"sfx_query\": \"sword slash\", \"dialogues\": [{{\"role\": \"NARRADOR\", \"text\": \"...\"}}], \"music_mood\": \"anime battle\"}}"
                     url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={ENGINE_CONFIG['gemini_key']}"
                     res = requests.post(url_g, json={"contents": [{"parts": [{"text": p_gem}, {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}]}]}, timeout=25)
                     v_data = json.loads(re.search(r"\{.*\}", res.json()["candidates"][0]["content"]["parts"][0]["text"], re.DOTALL).group(0))
@@ -341,11 +367,13 @@ with tabs[2]:
                         mood_bgm = v_data.get("music_mood", mood_bgm)
 
                     aud_p = f"/tmp/pdf_a_{i}.mp3"
+                    sfx_p = get_freesound_audio(ENGINE_CONFIG["fs_key"], v_data.get("sfx_query", "whoosh"), 1, 4, f"/tmp/pdf_sfx_{i}.mp3")
                     subs = asyncio.run(synthesize_multivoice_speech(dlgs, aud_p))
                     anim_p = f"/tmp/pdf_anim_{i}.mp4"
                     ok_a, _ = animate_image_cascade(img_p, anim_p, cluster_urls)
                     clip_p = f"/tmp/pdf_c_{i}.mp4"
-                    build_scene_clip(anim_p if ok_a else img_p, aud_p, subs, clip_p, is_video=ok_a)
+                    banner = f"{manga_series} - PARTE {next_p}" if i == 0 else ""
+                    build_scene_clip(anim_p if ok_a else img_p, aud_p, sfx_p, subs, clip_p, is_video=ok_a, hook_banner=banner)
                     c_obj = VideoFileClip(clip_p)
                     page_clips.append((clip_p, c_obj.duration))
                     c_obj.close()
@@ -360,13 +388,13 @@ with tabs[2]:
                 if batch:
                     parts.append(batch)
 
-                bgm_f = get_smart_bgm(ENGINE_CONFIG["fs_key"], mood_bgm)
+                bgm_f = get_freesound_audio(ENGINE_CONFIG["fs_key"], mood_bgm, 25, 120, "/tmp/pdf_bgm.mp3")
                 curr_p = next_p
                 for b_files in parts:
                     s_clips = [VideoFileClip(f) for f in b_files]
                     concat = concatenate_videoclips(s_clips, method="compose")
                     if bgm_f and os.path.exists(bgm_f):
-                        bgm = AudioFileClip(bgm_f).volumex(0.14)
+                        bgm = AudioFileClip(bgm_f).volumex(0.13)
                         bgm = bgm.loop(duration=concat.duration) if bgm.duration < concat.duration else bgm.subclip(0, concat.duration)
                         concat = concat.set_audio(CompositeAudioClip([concat.audio, bgm]))
 
