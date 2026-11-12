@@ -36,7 +36,6 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-# Mapeo de voces multi-personaje por idioma seleccionado
 VOICE_ROLES_BY_LANG = {
     "Español": {
         "NARRADOR": ("es-ES-AlvaroNeural", "+0Hz", "+0%"),
@@ -78,20 +77,32 @@ def get_sb_headers(sb_key: str):
         "Prefer": "return=representation"
     }
 
+def call_gemini_api(gemini_key: str, parts: list, timeout: int = 35):
+    """Llama a Gemini 2.5 Flash con respaldo automático y manejo seguro de errores."""
+    if not gemini_key:
+        raise ValueError("Falta configurar la Gemini API Key en Secrets.")
+    last_err = ""
+    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key.strip()}"
+        try:
+            res = requests.post(url, json={"contents": [{"parts": parts}]}, timeout=timeout)
+            data = res.json()
+            if "candidates" in data and data["candidates"]:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            last_err = data.get("error", {}).get("message", str(data))
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(f"Error de Gemini API: {last_err}")
+
 def translate_prompt_to_english(text: str, gemini_key: str) -> str:
-    """Traduce automáticamente la ficha visual al inglés si el usuario la escribió en otro idioma."""
     if not text or not gemini_key:
         return text
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
         prompt = f"Translate this anime character visual description into concise English image-generation keywords (only return the English keywords, nothing else): '{text}'"
-        res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
-        if res.status_code == 200:
-            translated = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return translated if translated else text
+        translated = call_gemini_api(gemini_key, [{"text": prompt}], timeout=15).strip()
+        return translated if translated else text
     except Exception:
-        pass
-    return text
+        return text
 
 def upload_to_supabase_storage(sb_url: str, sb_key: str, local_path: str, remote_filename: str, content_type: str = "video/mp4"):
     if not sb_url or not sb_key or not os.path.exists(local_path):
@@ -197,10 +208,6 @@ def get_script_details(sb_url: str, sb_key: str, series_name: str):
         pass
     return None
 
-# ==============================================================================
-# 1. MEMORIA VISUAL REAL (RETRATO FIJO + IMAGE-TO-IMAGE)
-# ==============================================================================
-
 def generate_character_portrait(char_prompt: str, hf_token: str, gemini_key: str = "", out_path: str = "/tmp/char_portrait.png"):
     en_prompt = translate_prompt_to_english(char_prompt, gemini_key)
     full_p = f"portrait close up of {en_prompt}, manhwa character sheet, front view, clean line art, studio lighting"
@@ -268,10 +275,6 @@ def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str
         pass
     return False
 
-# ==============================================================================
-# 2. EFECTOS DE SONIDO (SFX) + MÚSICA (BGM) + MULTI-VOZ MULTI-IDIOMA
-# ==============================================================================
-
 def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_dur: int, output_path: str):
     if not freesound_key or not query_tags:
         return None
@@ -331,10 +334,6 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
     for c in temp_clips:
         c.close()
     return all_subtitles
-
-# ==============================================================================
-# 3. HOOK VIRAL SUPERIOR + SUBTÍTULOS TIKTOK + TRANSICIONES FLASH
-# ==============================================================================
 
 def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_banner: str = ""):
     draw = ImageDraw.Draw(pil_img)
@@ -463,10 +462,6 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
     voice_clip.close()
     return out_mp4
 
-# ==============================================================================
-# 4. PUBLICACIÓN DIRECTA EN TIKTOK
-# ==============================================================================
-
 def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
     if not access_token or not os.path.exists(video_path):
         return False, "Falta Access Token de TikTok o archivo de video."
@@ -489,10 +484,6 @@ def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
         return r_up.status_code in [200, 201], "Subido a bandeja de TikTok."
     except Exception as e:
         return False, str(e)
-
-# ==============================================================================
-# 5. PIPELINE MAESTRO DE PRODUCCIÓN COMPLETA
-# ==============================================================================
 
 def produce_series_episode(series_name: str, custom_direction: str, config: dict, language_override: str = "", progress_callback=None):
     def log(msg):
@@ -526,7 +517,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     DIRECCIÓN: '{custom_direction}'.
     {master_ref}
     Asigna roles usando SOLO: NARRADOR, PROTAGONISTA, CHICA, VILLANO.
-    Los campos 'prompt' y 'sfx_query' DEBEN ir en inglés para los motores visuales y de sonido; 'hook_banner', 'description' y 'dialogues[].text' DEBEN ir en {target_lang}.
+    Los campos 'prompt' y 'sfx_query' DEBEN ir en inglés; 'hook_banner', 'description' y 'dialogues[].text' DEBEN ir en {target_lang}.
     Responde ÚNICAMENTE en JSON válido:
     {{
       "title": "{series_name} - Cap. {next_chap}",
@@ -562,9 +553,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
       ]
     }}
     """
-    url_g = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-    res_g = requests.post(url_g, json={"contents": [{"parts": [{"text": gem_prompt}]}]}, timeout=35)
-    txt = res_g.json()["candidates"][0]["content"]["parts"][0]["text"]
+    txt = call_gemini_api(gemini_key, [{"text": gem_prompt}], timeout=35)
     script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
     title = script_data["title"]
