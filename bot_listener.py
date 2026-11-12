@@ -4,14 +4,19 @@ import datetime
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
-from studio_engine import produce_series_episode, get_sb_headers
+from studio_engine import (
+    produce_series_episode,
+    get_sb_headers,
+    publish_to_tiktok_api,
+    publish_to_youtube_shorts
+)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Manga Studio Background Worker & Auto-Pilot LIVE!")
+        self.wfile.write(b"Manga Studio Pro Worker (TikTok + YT Shorts + Auto-Pilot) LIVE!")
 
     def log_message(self, format, *args):
         return
@@ -31,7 +36,13 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 HF_TOKEN = os.getenv("HF_API_TOKEN", "")
 FS_KEY = os.getenv("FREESOUND_API_KEY", "")
 MODAL_URL = os.getenv("MODAL_ENDPOINT_URL", "")
-AUTO_SERIES = os.getenv("AUTO_PILOT_SERIES", "Jun-woo: Neo-Seúl")
+
+TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN", "")
+YT_CONFIG = {
+    "client_id": os.getenv("YOUTUBE_CLIENT_ID", ""),
+    "client_secret": os.getenv("YOUTUBE_CLIENT_SECRET", ""),
+    "refresh_token": os.getenv("YOUTUBE_REFRESH_TOKEN", "")
+}
 
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN.strip()}" if BOT_TOKEN else ""
 
@@ -54,35 +65,16 @@ def send_tg_text(chat_id, text):
     except Exception:
         pass
 
-def trigger_background_production(series_name: str, chat_id):
-    send_tg_text(chat_id, f"⏳ Iniciando producción en segundo plano para '{series_name}' (Multi-Voz + Modal GPU)...")
+def get_episode_from_db(episode_id: str):
+    if not SB_URL or not SB_KEY:
+        return None
     try:
-        _, title, chap = produce_series_episode(
-            series_name=series_name,
-            custom_direction=f"Continúa la trama principal de {series_name} con acción intensa y un cliffhanger.",
-            config=ENGINE_CONFIG
-        )
-        send_tg_text(chat_id, f"✅ ¡{title} terminado y enviado! El próximo será el Capítulo #{chap + 1}.")
-    except Exception as e:
-        send_tg_text(chat_id, f"❌ Error en producción en segundo plano: {e}")
-
-def daily_autopilot_scheduler():
-    """Produce 1 capítulo automático todos los días a las 18:00 UTC."""
-    last_run_date = ""
-    while True:
-        time.sleep(45)
-        now = datetime.datetime.utcnow()
-        today_str = now.strftime("%Y-%m-%d")
-        if now.hour == 18 and now.minute == 0 and last_run_date != today_str:
-            last_run_date = today_str
-            if GEMINI_KEY and SB_URL:
-                threading.Thread(
-                    target=trigger_background_production,
-                    args=(AUTO_SERIES, CHAT_ID),
-                    daemon=True
-                ).start()
-
-threading.Thread(target=daily_autopilot_scheduler, daemon=True).start()
+        r = requests.get(f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?id=eq.{episode_id}", headers=get_sb_headers(SB_KEY), timeout=10)
+        if r.status_code == 200 and r.json():
+            return r.json()[0]
+    except Exception:
+        pass
+    return None
 
 def update_supabase_status(episode_id: str, new_status: str):
     if not SB_URL or not SB_KEY:
@@ -93,6 +85,80 @@ def update_supabase_status(episode_id: str, new_status: str):
         return r.status_code in [200, 204]
     except Exception:
         return False
+
+def execute_social_publish(episode_id: str, publish_yt: bool, chat_id: int, message_id: int):
+    ep = get_episode_from_db(episode_id)
+    if not ep or not ep.get("video_url"):
+        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"⚠️ No se encontró el archivo de video del Episodio #{episode_id}."}, timeout=10)
+        return
+
+    local_mp4 = f"/tmp/pub_{episode_id}.mp4"
+    try:
+        r_vid = requests.get(ep["video_url"], timeout=60)
+        with open(local_mp4, "wb") as f:
+            f.write(r_vid.content)
+    except Exception as e:
+        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"❌ Error descargando video: {e}"}, timeout=10)
+        return
+
+    title_full = f"{ep['title']} {ep.get('hashtags', '')}"
+    ok_tk, msg_tk = publish_to_tiktok_api(local_mp4, title_full, TIKTOK_ACCESS_TOKEN)
+    report = f"📱 TikTok: {msg_tk}"
+
+    if publish_yt:
+        ok_yt, msg_yt = publish_to_youtube_shorts(local_mp4, ep["title"], ep.get("description", ""), YT_CONFIG)
+        report += f"\n▶️ YouTube: {msg_yt}"
+
+    update_supabase_status(episode_id, "published")
+    requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"✅ **Episodio #{episode_id} Procesado**\n{report}"}, timeout=10)
+
+def get_all_saved_series():
+    if not SB_URL or not SB_KEY:
+        return []
+    try:
+        r = requests.get(f"{SB_URL.rstrip('/')}/rest/v1/saved_scripts?select=title&order=created_at.asc", headers=get_sb_headers(SB_KEY), timeout=10)
+        if r.status_code == 200:
+            return [row["title"] for row in r.json() if row.get("title")]
+    except Exception:
+        pass
+    return []
+
+def trigger_single_production(series_name: str, chat_id):
+    send_tg_text(chat_id, f"⏳ Produciendo '{series_name}' (Memoria Visual + SFX + Multi-Voz)...")
+    try:
+        _, title, chap = produce_series_episode(
+            series_name=series_name,
+            custom_direction=f"Continúa la trama principal de {series_name} con acción intensa y un cliffhanger.",
+            config=ENGINE_CONFIG
+        )
+        send_tg_text(chat_id, f"✅ ¡{title} listo! El próximo será el Capítulo #{chap + 1}.")
+    except Exception as e:
+        send_tg_text(chat_id, f"❌ Error produciendo '{series_name}': {e}")
+
+def trigger_all_series_production(chat_id):
+    series_list = get_all_saved_series()
+    if not series_list:
+        send_tg_text(chat_id, "⚠️ No hay series guardadas en Supabase.")
+        return
+    send_tg_text(chat_id, f"🚀 Piloto Automático Multi-Serie ({len(series_list)} series): {', '.join(series_list)}")
+    for idx, s_name in enumerate(series_list):
+        trigger_single_production(s_name, chat_id)
+        if idx < len(series_list) - 1:
+            time.sleep(15)
+    send_tg_text(chat_id, "🏁 Ronda diaria completada.")
+
+def daily_autopilot_scheduler():
+    last_run_date = ""
+    while True:
+        time.sleep(45)
+        now = datetime.datetime.utcnow()
+        today_str = now.strftime("%Y-%m-%d")
+        if now.hour == 18 and now.minute == 0 and last_run_date != today_str:
+            last_run_date = today_str
+            if GEMINI_KEY and SB_URL:
+                threading.Thread(target=trigger_all_series_production, args=(CHAT_ID,), daemon=True).start()
+
+threading.Thread(target=daily_autopilot_scheduler, daemon=True).start()
 
 def start_polling():
     if not TG_API_BASE:
@@ -111,13 +177,17 @@ def start_polling():
                 if "message" in update and "text" in update["message"]:
                     msg_text = update["message"]["text"].strip()
                     c_id = update["message"]["chat"]["id"]
-                    if msg_text.startswith("/producir"):
-                        s_name = msg_text.replace("/producir", "").strip() or AUTO_SERIES
-                        threading.Thread(
-                            target=trigger_background_production,
-                            args=(s_name, c_id),
-                            daemon=True
-                        ).start()
+
+                    if msg_text == "/producir_todas":
+                        threading.Thread(target=trigger_all_series_production, args=(c_id,), daemon=True).start()
+                    elif msg_text.startswith("/producir"):
+                        s_name = msg_text.replace("/producir", "").strip()
+                        if s_name:
+                            threading.Thread(target=trigger_single_production, args=(s_name, c_id), daemon=True).start()
+                        else:
+                            series_avail = get_all_saved_series()
+                            lista = "\n".join([f"• `/producir {s}`" for s in series_avail]) if series_avail else "Ninguna serie guardada aún."
+                            send_tg_text(c_id, f"📚 Series disponibles:\n{lista}\n\nO usa `/producir_todas`")
 
                 if "callback_query" in update:
                     cb = update["callback_query"]
@@ -127,17 +197,21 @@ def start_polling():
                     chat_id = msg.get("chat", {}).get("id")
                     message_id = msg.get("message_id")
 
-                    if cb_data.startswith("publish_"):
-                        ep_id = cb_data.replace("publish_", "")
-                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Aprobado"}, timeout=10)
-                        ok = update_supabase_status(ep_id, "uploaded")
-                        txt = f"✅ Episodio #{ep_id} aprobado para TikTok." if ok else f"⚠️ Error BD #{ep_id}"
-                        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": txt}, timeout=10)
+                    if cb_data.startswith("publish_all_"):
+                        ep_id = cb_data.replace("publish_all_", "")
+                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Subiendo a TikTok y YouTube..."}, timeout=10)
+                        threading.Thread(target=execute_social_publish, args=(ep_id, True, chat_id, message_id), daemon=True).start()
+
+                    elif cb_data.startswith("publish_tk_"):
+                        ep_id = cb_data.replace("publish_tk_", "")
+                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Subiendo a TikTok..."}, timeout=10)
+                        threading.Thread(target=execute_social_publish, args=(ep_id, False, chat_id, message_id), daemon=True).start()
 
                     elif cb_data.startswith("retry_"):
                         ep_id = cb_data.replace("retry_", "")
-                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Regenerando..."}, timeout=10)
-                        threading.Thread(target=trigger_background_production, args=(AUTO_SERIES, chat_id), daemon=True).start()
+                        requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Encolado"}, timeout=10)
+                        update_supabase_status(ep_id, "queued_retry")
+                        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"⏳ Episodio #{ep_id} marcado para reintento."}, timeout=10)
         except Exception:
             time.sleep(3)
 
