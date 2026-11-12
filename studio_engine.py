@@ -15,6 +15,11 @@ except ImportError:
     edge_tts = None
 
 try:
+    from gtts import gTTS
+except ImportError:
+    gTTS = None
+
+try:
     from moviepy.editor import (
         VideoFileClip,
         ImageClip,
@@ -69,6 +74,14 @@ VOICE_ROLES_BY_LANG = {
     }
 }
 
+LANG_TO_GTTS = {
+    "Español": "es",
+    "Inglés": "en",
+    "Portugués": "pt",
+    "Francés": "fr",
+    "Japonés": "ja"
+}
+
 def get_sb_headers(sb_key: str):
     return {
         "apikey": sb_key.strip(),
@@ -104,10 +117,7 @@ def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
         "x-goog-api-key": key_clean
     }
 
-    # 1. Primero consulta dinámicamente qué modelos tiene autorizados tu clave
     endpoints = discover_gemini_models(key_clean, headers)
-
-    # 2. Respaldos directos por si el listado no responde
     fallback_endpoints = [
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
@@ -330,38 +340,72 @@ def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_d
         pass
     return None
 
+def clean_tts_text(raw_text: str) -> str:
+    """Elimina símbolos o etiquetas que hacen que edge-tts rechace el texto."""
+    txt = re.sub(r"\[.*?\]", "", raw_text)
+    txt = re.sub(r"[*_#~`]", "", txt).strip()
+    return txt
+
 async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: str, language: str = "Español"):
     temp_clips = []
     all_subtitles = []
     current_offset = 0.0
 
     lang_voices = VOICE_ROLES_BY_LANG.get(language, VOICE_ROLES_BY_LANG["Español"])
+    gtts_lang = LANG_TO_GTTS.get(language, "es")
 
     for idx, line in enumerate(dialogue_lines):
         role = line.get("role", "NARRADOR").upper()
-        text = line.get("text", "").strip()
+        text = clean_tts_text(line.get("text", ""))
         if not text:
             continue
 
         voice, pitch, rate = lang_voices.get(role, lang_voices["NARRADOR"])
         part_path = f"/tmp/mv_part_{idx}.mp3"
-
-        communicate = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
         part_words = []
-        with open(part_path, "wb") as f:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    w_start = (chunk["offset"] / 10_000_000) + current_offset
-                    w_end = ((chunk["offset"] + chunk["duration"]) / 10_000_000) + current_offset
-                    part_words.append({"word": chunk["text"], "start": w_start, "end": w_end})
+        edge_ok = False
 
-        if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+        # 1. Intento principal con Edge-TTS (Multi-voz neuronal)
+        if edge_tts:
+            try:
+                communicate = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
+                with open(part_path, "wb") as f:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            f.write(chunk["data"])
+                        elif chunk["type"] == "WordBoundary":
+                            w_start = (chunk["offset"] / 10_000_000) + current_offset
+                            w_end = ((chunk["offset"] + chunk["duration"]) / 10_000_000) + current_offset
+                            part_words.append({"word": chunk["text"], "start": w_start, "end": w_end})
+                if os.path.exists(part_path) and os.path.getsize(part_path) > 100:
+                    edge_ok = True
+            except Exception:
+                edge_ok = False
+
+        # 2. Respaldo automático con gTTS si Edge-TTS es bloqueado por IP compartida en la nube
+        if not edge_ok and gTTS:
+            try:
+                tts = gTTS(text=text, lang=gtts_lang, slow=False)
+                tts.save(part_path)
+            except Exception:
+                continue
+
+        if os.path.exists(part_path) and os.path.getsize(part_path) > 100:
             clip = AudioFileClip(part_path)
+            if not part_words:
+                words = text.split()
+                if words:
+                    w_dur = clip.duration / len(words)
+                    for w_i, w_str in enumerate(words):
+                        part_words.append({
+                            "word": w_str,
+                            "start": current_offset + (w_i * w_dur),
+                            "end": current_offset + ((w_i + 1) * w_dur)
+                        })
             temp_clips.append(clip)
             all_subtitles.extend(part_words)
             current_offset += clip.duration
+            await asyncio.sleep(0.25)
 
     if not temp_clips:
         return []
