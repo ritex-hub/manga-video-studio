@@ -23,6 +23,7 @@ try:
         concatenate_videoclips,
         concatenate_audioclips
     )
+    from moviepy.video.fx.all import fadein
 except ImportError:
     VideoFileClip = None
     ImageClip = None
@@ -35,7 +36,15 @@ except ImportError:
     GradioClient = None
     handle_file = None
 
-# Mapeo de voces distintas por rol para doblaje multi-personaje
+try:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+except ImportError:
+    Credentials = None
+    build = None
+    MediaFileUpload = None
+
 VOICE_ROLES = {
     "NARRADOR": ("es-ES-AlvaroNeural", "+0Hz", "+0%"),
     "PROTAGONISTA": ("es-MX-JorgeNeural", "+2Hz", "+5%"),
@@ -50,6 +59,27 @@ def get_sb_headers(sb_key: str):
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
+
+def upload_to_supabase_storage(sb_url: str, sb_key: str, local_path: str, remote_filename: str, content_type: str = "video/mp4"):
+    """Sube un video o retrato al bucket público 'manga-media' y devuelve su URL pública."""
+    if not sb_url or not sb_key or not os.path.exists(local_path):
+        return ""
+    base = sb_url.rstrip("/")
+    upload_url = f"{base}/storage/v1/object/manga-media/{remote_filename}"
+    headers = {
+        "apikey": sb_key.strip(),
+        "Authorization": f"Bearer {sb_key.strip()}",
+        "Content-Type": content_type,
+        "x-upsert": "true"
+    }
+    try:
+        with open(local_path, "rb") as f:
+            r = requests.post(upload_url, headers=headers, data=f.read(), timeout=60)
+        if r.status_code in [200, 201]:
+            return f"{base}/storage/v1/object/public/manga-media/{remote_filename}"
+    except Exception:
+        pass
+    return ""
 
 def get_dynamic_cluster_urls(sb_url: str, sb_key: str, default_modal: str = ""):
     nodes = {"modal": default_modal, "kaggle": "", "colab1": "", "colab2": ""}
@@ -100,7 +130,7 @@ def update_series_progress(sb_url: str, sb_key: str, series_name: str, chapter_n
     except Exception:
         pass
 
-def save_episode_to_supabase(sb_url, sb_key, series_name, chapter_num, title, desc, tags, prompt, narr, status="pending"):
+def save_episode_to_supabase(sb_url, sb_key, series_name, chapter_num, title, desc, tags, prompt, narr, status="pending", video_url=""):
     if not sb_url or not sb_key:
         return 0
     endpoint = f"{sb_url.rstrip('/')}/rest/v1/manga_episodes"
@@ -112,7 +142,8 @@ def save_episode_to_supabase(sb_url, sb_key, series_name, chapter_num, title, de
         "hashtags": tags,
         "prompt": prompt,
         "narration": narr,
-        "status": status
+        "status": status,
+        "video_url": video_url
     }
     try:
         r = requests.post(endpoint, headers=get_sb_headers(sb_key), json=payload, timeout=8)
@@ -135,8 +166,99 @@ def get_script_details(sb_url: str, sb_key: str, series_name: str):
     return None
 
 # ==============================================================================
-# DOBLAJE MULTI-VOZ Y SUBTÍTULOS DINÁMICOS ESTILO TIKTOK / CAPCUT
+# 1. MEMORIA VISUAL REAL (RETRATO FIJO + IMAGE-TO-IMAGE)
 # ==============================================================================
+
+def generate_character_portrait(char_prompt: str, hf_token: str, out_path: str = "/tmp/char_portrait.png"):
+    """Genera el retrato oficial del protagonista para mantener su rostro en toda la temporada."""
+    full_p = f"portrait close up of {char_prompt}, manhwa character sheet, front view, clean line art, studio lighting"
+    if hf_token:
+        try:
+            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
+            res = requests.post(api_url, headers=headers, json={"inputs": full_p}, timeout=45)
+            if res.status_code == 200:
+                with open(out_path, "wb") as f:
+                    f.write(res.content)
+                return out_path
+        except Exception:
+            pass
+    try:
+        encoded = urllib.parse.quote(full_p)
+        r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=1024&nologo=true&model=flux", timeout=40)
+        if r.status_code == 200:
+            with open(out_path, "wb") as f:
+                f.write(r.content)
+            return out_path
+    except Exception:
+        pass
+    return None
+
+def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str, hf_token: str, output_path: str, seed: int = 42):
+    """Usa el retrato de referencia (Image-to-Image) si existe, o texto-a-imagen con ancla visual."""
+    full_prompt = f"{char_anchor}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
+
+    # Intento Image-to-Image si hay retrato guardado y token de HF
+    if ref_image_url and hf_token:
+        try:
+            r_ref = requests.get(ref_image_url, timeout=15)
+            if r_ref.status_code == 200:
+                i2i_url = "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix"
+                headers = {"Authorization": f"Bearer {hf_token.strip()}"}
+                img_b64 = base64.b64encode(r_ref.content).decode("utf-8")
+                payload = {"inputs": full_prompt, "parameters": {"image": img_b64, "image_guidance_scale": 1.4}}
+                res = requests.post(i2i_url, headers=headers, json=payload, timeout=45)
+                if res.status_code == 200:
+                    with open(output_path, "wb") as f:
+                        f.write(res.content)
+                    return True
+        except Exception:
+            pass
+
+    if hf_token:
+        try:
+            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
+            res = requests.post(api_url, headers=headers, json={"inputs": full_prompt, "parameters": {"seed": seed}}, timeout=40)
+            if res.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(res.content)
+                return True
+        except Exception:
+            pass
+
+    try:
+        encoded = urllib.parse.quote(full_prompt)
+        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&seed={seed}&nologo=true&model=flux", timeout=40)
+        if r_poll.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(r_poll.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+# ==============================================================================
+# 2. EFECTOS DE SONIDO (SFX) + MÚSICA (BGM) + MULTI-VOZ
+# ==============================================================================
+
+def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_dur: int, output_path: str):
+    if not freesound_key or not query_tags:
+        return None
+    query = urllib.parse.quote(query_tags)
+    url = f"https://freesound.org/apiv2/search/text/?query={query}&token={freesound_key}&filter=duration:[{min_dur}+TO+{max_dur}]&fields=id,name,previews"
+    try:
+        res = requests.get(url, timeout=12)
+        if res.status_code == 200 and res.json().get("results"):
+            preview_url = res.json()["results"][0]["previews"]["preview-hq-mp3"]
+            r_audio = requests.get(preview_url, timeout=20)
+            if r_audio.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(r_audio.content)
+                return output_path
+    except Exception:
+        pass
+    return None
 
 async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: str):
     temp_clips = []
@@ -178,8 +300,29 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
         c.close()
     return all_subtitles
 
-def overlay_tiktok_subtitles(pil_img, subtitles: list, current_time: float):
-    """Dibuja bloques de 3 palabras centradas resaltando la palabra activa en verde neón."""
+# ==============================================================================
+# 3. HOOK VIRAL SUPERIOR + SUBTÍTULOS TIKTOK + TRANSICIONES FLASH
+# ==============================================================================
+
+def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_banner: str = ""):
+    draw = ImageDraw.Draw(pil_img)
+    w, h = pil_img.size
+
+    # A) Hook visual superior en los primeros 2.5 segundos de la Escena 1
+    if hook_banner and current_time <= 2.5:
+        try:
+            h_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
+        except Exception:
+            h_font = ImageFont.load_default()
+        hb = draw.textbbox((0, 0), hook_banner.upper(), font=h_font)
+        hw, hh = hb[2] - hb[0], hb[3] - hb[1]
+        hx = (w - hw) // 2
+        hy = int(h * 0.14)
+        # Caja roja/morada llamativa detrás del título
+        draw.rectangle([hx - 24, hy - 14, hx + hw + 24, hy + hh + 18], fill=(180, 20, 60))
+        draw.text((hx, hy), hook_banner.upper(), font=h_font, fill=(255, 255, 255))
+
+    # B) Subtítulos dinámicos palabra por palabra (verde neón activo)
     if not subtitles:
         return pil_img
 
@@ -195,8 +338,6 @@ def overlay_tiktok_subtitles(pil_img, subtitles: list, current_time: float):
     chunk_start = (active_idx // 3) * 3
     chunk = subtitles[chunk_start:chunk_start + 3]
 
-    draw = ImageDraw.Draw(pil_img)
-    w, h = pil_img.size
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 62)
     except Exception:
@@ -223,34 +364,6 @@ def overlay_tiktok_subtitles(pil_img, subtitles: list, current_time: float):
         x_cursor += (w_bbox[2] - w_bbox[0])
 
     return pil_img
-
-# ==============================================================================
-# GENERACIÓN VISUAL Y RENDERIZADO GPU EN CASCADA
-# ==============================================================================
-
-def generate_image_base(prompt: str, char_anchor: str, hf_token: str, output_path: str, seed: int = 42):
-    full_prompt = f"{char_anchor}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
-    if hf_token:
-        try:
-            api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-            headers = {"Authorization": f"Bearer {hf_token.strip()}"}
-            res = requests.post(api_url, headers=headers, json={"inputs": full_prompt, "parameters": {"seed": seed}}, timeout=40)
-            if res.status_code == 200:
-                with open(output_path, "wb") as f:
-                    f.write(res.content)
-                return True
-        except Exception:
-            pass
-    try:
-        encoded = urllib.parse.quote(full_prompt)
-        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&seed={seed}&nologo=true&model=flux", timeout=40)
-        if r_poll.status_code == 200:
-            with open(output_path, "wb") as f:
-                f.write(r_poll.content)
-            return True
-    except Exception:
-        pass
-    return False
 
 def animate_image_cascade(image_path: str, output_video_path: str, cluster_urls: dict):
     if cluster_urls.get("modal"):
@@ -279,31 +392,14 @@ def animate_image_cascade(image_path: str, output_video_path: str, cluster_urls:
                     pass
     return False, "Zoom Cinemático (CPU)"
 
-def get_smart_bgm(freesound_key: str, mood_tags: str, output_path: str = "/tmp/bgm.mp3"):
-    if not freesound_key:
-        return None
-    query = urllib.parse.quote(mood_tags if mood_tags else "anime action epic soundtrack")
-    url = f"https://freesound.org/apiv2/search/text/?query={query}&token={freesound_key}&filter=duration:[25+TO+120]&fields=id,name,previews"
-    try:
-        res = requests.get(url, timeout=12)
-        if res.status_code == 200 and res.json().get("results"):
-            preview_url = res.json()["results"][0]["previews"]["preview-hq-mp3"]
-            r_audio = requests.get(preview_url, timeout=20)
-            if r_audio.status_code == 200:
-                with open(output_path, "wb") as f:
-                    f.write(r_audio.content)
-                return output_path
-    except Exception:
-        pass
-    return None
-
-def build_scene_clip(visual_path: str, audio_path: str, subtitles: list, out_mp4: str, is_video: bool):
+def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles: list, out_mp4: str, is_video: bool, hook_banner: str = ""):
     voice_clip = AudioFileClip(audio_path)
     dur = voice_clip.duration + 0.15
+
     if is_video and VideoFileClip:
         base = VideoFileClip(visual_path)
         base = base.loop(duration=dur) if base.duration < dur else base.subclip(0, dur)
-        scene = base.fl(lambda gf, t: np.array(overlay_tiktok_subtitles(Image.fromarray(gf(t)), subtitles, t)))
+        scene = base.fl(lambda gf, t: np.array(overlay_tiktok_and_hook(Image.fromarray(gf(t)), subtitles, t, hook_banner)))
     else:
         target_w, target_h = 1080, 1920
         b_img = Image.open(visual_path).convert("RGB")
@@ -313,29 +409,103 @@ def build_scene_clip(visual_path: str, audio_path: str, subtitles: list, out_mp4
         crp = res.crop((l, top, l + target_w, top + target_h))
 
         def frame_zoom(t):
-            zf = 1.0 + 0.05 * (t / max(dur, 1))
+            zf = 1.0 + 0.06 * (t / max(dur, 1))
             zw, zh = int(target_w * zf), int(target_h * zf)
             z_img = crp.resize((zw, zh), Image.Resampling.BILINEAR)
             f_img = z_img.crop(((zw - target_w) // 2, (zh - target_h) // 2, (zw + target_w) // 2, (zh + target_h) // 2))
-            return np.array(overlay_tiktok_subtitles(f_img, subtitles, t))
+            return np.array(overlay_tiktok_and_hook(f_img, subtitles, t, hook_banner))
 
         scene = ImageClip(np.array(crp)).set_duration(dur).fl(lambda gf, t: frame_zoom(t))
 
-    scene = scene.set_audio(voice_clip)
+    # Transición rápida de entrada (flash/fade)
+    scene = fadein(scene, 0.25)
+
+    # Mezcla de Voz + Efecto de Sonido (SFX) al inicio de la escena
+    audio_tracks = [voice_clip]
+    if sfx_path and os.path.exists(sfx_path):
+        try:
+            sfx_clip = AudioFileClip(sfx_path).volumex(0.45)
+            if sfx_clip.duration > dur:
+                sfx_clip = sfx_clip.subclip(0, dur)
+            audio_tracks.append(sfx_clip)
+        except Exception:
+            pass
+
+    scene = scene.set_audio(CompositeAudioClip(audio_tracks))
     scene.write_videofile(out_mp4, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     voice_clip.close()
     return out_mp4
 
 # ==============================================================================
-# PIPELINE COMPLETO EJECUTABLE DESDE STREAMLIT O EN SEGUNDO PLANO (RENDER/TG)
+# 4. PUBLICACIÓN EN TIKTOK Y YOUTUBE SHORTS
 # ==============================================================================
 
-def produce_series_episode(
-    series_name: str,
-    custom_direction: str,
-    config: dict,
-    progress_callback=None
-):
+def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
+    if not access_token or not os.path.exists(video_path):
+        return False, "Falta Access Token de TikTok o archivo de video."
+    file_size = os.path.getsize(video_path)
+    init_url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+    headers = {"Authorization": f"Bearer {access_token.strip()}", "Content-Type": "application/json"}
+    payload = {
+        "post_info": {"title": title[:150], "privacy_level": "SELF_ONLY"},
+        "source_info": {"source": "FILE_UPLOAD", "video_size": file_size, "chunk_size": file_size, "total_chunk_count": 1}
+    }
+    try:
+        r_init = requests.post(init_url, headers=headers, json=payload, timeout=20)
+        upload_url = r_init.json().get("data", {}).get("upload_url")
+        if not upload_url:
+            return False, f"Error init TikTok: {r_init.text}"
+        with open(video_path, "rb") as f:
+            vid_bytes = f.read()
+        up_headers = {"Content-Range": f"bytes 0-{file_size-1}/{file_size}", "Content-Type": "video/mp4"}
+        r_up = requests.put(upload_url, headers=up_headers, data=vid_bytes, timeout=60)
+        return r_up.status_code in [200, 201], "Subido a bandeja de TikTok."
+    except Exception as e:
+        return False, str(e)
+
+def publish_to_youtube_shorts(video_path: str, title: str, description: str, yt_config: dict):
+    """Sube el video vertical directamente como YouTube Short usando OAuth Refresh Token."""
+    if not Credentials or not build or not MediaFileUpload:
+        return False, "Librerías de Google API no instaladas."
+    client_id = yt_config.get("client_id", "")
+    client_secret = yt_config.get("client_secret", "")
+    refresh_token = yt_config.get("refresh_token", "")
+    if not (client_id and client_secret and refresh_token and os.path.exists(video_path)):
+        return False, "Faltan credenciales de YouTube en Secrets/Render."
+
+    try:
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token.strip(),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id.strip(),
+            client_secret=client_secret.strip()
+        )
+        youtube = build("youtube", "v3", credentials=creds)
+        body = {
+            "snippet": {
+                "title": f"{title[:85]} #Shorts",
+                "description": f"{description}\n\n#Shorts #Anime #Manhwa",
+                "tags": ["Shorts", "Anime", "Manhwa", "Manga"],
+                "categoryId": "24"
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False
+            }
+        }
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = request.execute()
+        return True, f"Publicado en YouTube Shorts (ID: {response.get('id')})"
+    except Exception as e:
+        return False, f"Error YouTube: {e}"
+
+# ==============================================================================
+# 5. PIPELINE MAESTRO DE PRODUCCIÓN COMPLETA
+# ==============================================================================
+
+def produce_series_episode(series_name: str, custom_direction: str, config: dict, progress_callback=None):
     def log(msg):
         if progress_callback:
             progress_callback(msg)
@@ -351,26 +521,31 @@ def produce_series_episode(
 
     next_chap, prev_summary = get_series_continuity(sb_url, sb_key, series_name)
     script_obj = get_script_details(sb_url, sb_key, series_name)
+
     char_anchor = script_obj.get("character_prompt") if script_obj and script_obj.get("character_prompt") else "young anime warrior, detailed manhwa style"
+    ref_img_url = script_obj.get("reference_image_url", "") if script_obj else ""
     master_ref = f"\nGUION MAESTRO:\n{script_obj['script_content'][:2500]}" if script_obj else ""
 
-    log(f"🧠 Escribiendo guion multi-voz para '{series_name}' — Capítulo #{next_chap}...")
+    log(f"🧠 Escribiendo guion con SFX y Hook viral para '{series_name}' — Cap. #{next_chap}...")
 
     gem_prompt = f"""
     Eres el director de la serie '{series_name}'. Escribe el CAPÍTULO #{next_chap} en 3 escenas consecutivas.
     LO QUE YA PASÓ ANTES (PROHIBIDO REPETIR): '{prev_summary}'.
     DIRECCIÓN: '{custom_direction}'.
     {master_ref}
-    Asigna roles de doblaje en cada escena usando SOLO estos roles: NARRADOR, PROTAGONISTA, CHICA, VILLANO.
+    Asigna roles usando SOLO: NARRADOR, PROTAGONISTA, CHICA, VILLANO.
+    Incluye un 'hook_banner' corto (máx 5 palabras en español) y un 'sfx_query' (1-2 palabras en inglés para sonido de acción en Freesound).
     Responde ÚNICAMENTE en JSON válido:
     {{
       "title": "{series_name} - Cap. {next_chap}",
+      "hook_banner": "CAPÍTULO {next_chap}: ¡EL ATAQUE!",
       "description": "Resumen breve de lo ocurrido en este capítulo para continuar en el siguiente",
       "hashtags": "#manhwa #anime #webtoon #fyp",
       "mood_music": "cyberpunk dark synth epic action",
       "scenes": [
         {{
           "prompt": "Detailed visual prompt in English for scene 1",
+          "sfx_query": "sword unsheath",
           "dialogues": [
             {{"role": "NARRADOR", "text": "Texto narrado"}},
             {{"role": "PROTAGONISTA", "text": "Diálogo del héroe"}}
@@ -378,6 +553,7 @@ def produce_series_episode(
         }},
         {{
           "prompt": "Detailed visual prompt in English for scene 2",
+          "sfx_query": "thunder explosion",
           "dialogues": [
             {{"role": "VILLANO", "text": "Amenaza del enemigo"}},
             {{"role": "CHICA", "text": "Reacción de aliada"}}
@@ -385,6 +561,7 @@ def produce_series_episode(
         }},
         {{
           "prompt": "Detailed visual prompt in English for scene 3",
+          "sfx_query": "energy blast",
           "dialogues": [
             {{"role": "PROTAGONISTA", "text": "Ataque final"}},
             {{"role": "NARRADOR", "text": "Gancho final del capítulo"}}
@@ -399,36 +576,39 @@ def produce_series_episode(
     script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
 
     title = script_data["title"]
+    hook_text = script_data.get("hook_banner", f"CAPÍTULO {next_chap}")
     desc = script_data["description"]
     tags = script_data["hashtags"]
     mood = script_data["mood_music"]
     scenes = script_data["scenes"]
 
-    first_line = scenes[0]["dialogues"][0]["text"] if scenes[0].get("dialogues") else ""
-    ep_id = save_episode_to_supabase(sb_url, sb_key, series_name, next_chap, title, desc, tags, scenes[0]["prompt"], first_line, "processing")
-
     cluster_urls = get_dynamic_cluster_urls(sb_url, sb_key, modal_url)
     rendered_files = []
 
     for idx, sc in enumerate(scenes):
-        log(f"🎬 Produciendo Escena {idx+1}/3 (Multi-Voz + GPU)...")
+        log(f"🎬 Escena {idx+1}/3 (Memoria Visual + SFX + Multi-Voz)...")
         img_f = f"/tmp/bg_s_{idx}.png"
         aud_f = f"/tmp/bg_a_{idx}.mp3"
+        sfx_f = f"/tmp/bg_sfx_{idx}.mp3"
         mp4_f = f"/tmp/bg_m_{idx}.mp4"
         anim_f = f"/tmp/bg_anim_{idx}.mp4"
 
-        generate_image_base(sc["prompt"], char_anchor, hf_token, img_f, seed=next_chap * 100 + idx)
+        generate_image_with_memory(sc["prompt"], char_anchor, ref_img_url, hf_token, img_f, seed=next_chap * 100 + idx)
         subs = asyncio.run(synthesize_multivoice_speech(sc.get("dialogues", []), aud_f))
+        sfx_path = get_freesound_audio(fs_key, sc.get("sfx_query", "whoosh"), 1, 4, sfx_f)
+
         ok_anim, engine = animate_image_cascade(img_f, anim_f, cluster_urls)
-        log(f"   ↳ Renderizado con: {engine}")
-        build_scene_clip(anim_f if ok_anim else img_f, aud_f, subs, mp4_f, is_video=ok_anim)
+        log(f"   ↳ GPU: {engine} | SFX: {sc.get('sfx_query', 'none')}")
+
+        banner = hook_text if idx == 0 else ""
+        build_scene_clip(anim_f if ok_anim else img_f, aud_f, sfx_path, subs, mp4_f, is_video=ok_anim, hook_banner=banner)
         rendered_files.append(mp4_f)
 
     clips = [VideoFileClip(p) for p in rendered_files]
     final_vid = concatenate_videoclips(clips, method="compose")
-    bgm_p = get_smart_bgm(fs_key, mood)
+    bgm_p = get_freesound_audio(fs_key, mood, 25, 120, "/tmp/bgm_main.mp3")
     if bgm_p and os.path.exists(bgm_p):
-        bgm = AudioFileClip(bgm_p).volumex(0.14)
+        bgm = AudioFileClip(bgm_p).volumex(0.13)
         bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
         final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
 
@@ -437,14 +617,25 @@ def produce_series_episode(
     for c in clips:
         c.close()
 
+    # Subir video final a Supabase Storage para que Telegram/Render pueda publicarlo en TikTok y YouTube
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", series_name)
+    public_video_url = upload_to_supabase_storage(sb_url, sb_key, out_final, f"videos/{safe_name}_cap_{next_chap}.mp4", "video/mp4")
+
+    first_line = scenes[0]["dialogues"][0]["text"] if scenes[0].get("dialogues") else ""
+    ep_id = save_episode_to_supabase(sb_url, sb_key, series_name, next_chap, title, desc, tags, scenes[0]["prompt"], first_line, "ready", public_video_url)
     update_series_progress(sb_url, sb_key, series_name, next_chap, desc)
 
     if tg_token and tg_chat and os.path.exists(out_final):
         keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ Publicar en TikTok", "callback_data": f"publish_{ep_id}"},
-                {"text": "🔄 Regenerar", "callback_data": f"retry_{ep_id}"}
-            ]]
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Publicar TikTok + YT Shorts", "callback_data": f"publish_all_{ep_id}"},
+                    {"text": "📱 Solo TikTok", "callback_data": f"publish_tk_{ep_id}"}
+                ],
+                [
+                    {"text": "🔄 Regenerar Capítulo", "callback_data": f"retry_{ep_id}"}
+                ]
+            ]
         }
         url_tg = f"https://api.telegram.org/bot{tg_token.strip()}/sendVideo"
         with open(out_final, "rb") as vf:
