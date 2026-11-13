@@ -88,8 +88,21 @@ def delete_queue_placeholder(episode_id):
     except Exception:
         pass
 
+def recover_stuck_jobs():
+    """Al arrancar Render, devuelve a 'queued' cualquier tarea que haya quedado atascada en 'processing'."""
+    if not (SB_URL and SB_KEY):
+        return
+    try:
+        url = f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?status=eq.processing"
+        r = requests.patch(url, headers=get_sb_headers(SB_KEY), json={"status": "queued"}, timeout=10)
+        if r.status_code in [200, 204] and r.text and r.text != "[]":
+            print("[WORKER] Tareas atascadas recuperadas automáticamente a 'queued'.", flush=True)
+    except Exception as e:
+        print(f"[WORKER RECOVER ERROR] {e}", flush=True)
+
 def supabase_queue_worker():
     """Revisa cada 10 segundos si Streamlit encoló una serie con status='queued'."""
+    recover_stuck_jobs()
     print("[WORKER] Cola de Supabase iniciada y escuchando...", flush=True)
     while True:
         time.sleep(10)
