@@ -137,19 +137,18 @@ def fetch_recent_episodes():
     except Exception:
         return []
 
-def send_remote_telegram_command(cmd_text: str):
-    tg_token, tg_chat = ENGINE_CONFIG["tg_token"], ENGINE_CONFIG["tg_chat"]
-    if not tg_token or not tg_chat:
+def enqueue_background_production(series_name: str, language: str = "Español"):
+    """Encola la serie directamente en Supabase para que Render la produzca en segundo plano."""
+    sb_url, sb_key = ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"]
+    if not sb_url or not sb_key:
         return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{tg_token}/sendMessage",
-            json={"chat_id": tg_chat, "text": cmd_text},
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception:
-        return False
+    next_chap, _ = get_series_continuity(sb_url, sb_key, series_name)
+    ep_id = save_episode_to_supabase(
+        sb_url, sb_key, series_name, next_chap,
+        f"{series_name} - Cap. {next_chap}",
+        f"LANG:{language}", "#manhwa #anime", "QUEUED", "", status="queued"
+    )
+    return ep_id > 0
 
 # ==============================================================================
 # BARRA LATERAL COMPLETA
@@ -185,7 +184,7 @@ with st.sidebar:
         <div>🧠 <b>Gemini AI:</b> {'🟢 Listo' if ENGINE_CONFIG['gemini_key'] else '🔴 Sin Key'}</div>
         <div>🎨 <b>Hugging Face:</b> {'🟢 Listo' if ENGINE_CONFIG['hf_token'] else '🟡 Pollinations'}</div>
         <div>🎵 <b>Freesound SFX/BGM:</b> {'🟢 Listo' if ENGINE_CONFIG['fs_key'] else '🔴 Sin Key'}</div>
-        <div>✈️ <b>Telegram Bot:</b> {'🟢 Conectado' if ENGINE_CONFIG['tg_token'] else '🔴 Sin Token'}</div>
+        <div>✈️ <b>@MangaStudioPro_bot:</b> {'🟢 Conectado' if ENGINE_CONFIG['tg_token'] else '🔴 Sin Token'}</div>
         <div>📱 <b>TikTok API:</b> {'🟢 Token Activo' if DEFAULT_ACCESS_TOKEN else '🔴 Sin Token'}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -280,14 +279,18 @@ with tabs[0]:
                     st.error(f"⚠️ {e}")
 
         if b2.button("☁️ Producir en Segundo Plano (Render)", use_container_width=True):
-            if send_remote_telegram_command(f"/producir {series_name}"):
-                st.success("🚀 Orden enviada a Render. Puedes cerrar esta pestaña; tu bot te enviará el video listo.")
+            if enqueue_background_production(series_name, prod_lang):
+                st.success(f"🚀 Capítulo #{next_chap} de '{series_name}' ({prod_lang}) enviado a Render. Te llegará a @MangaStudioPro_bot al terminar.")
             else:
-                st.info(f"💡 Envía `/producir {series_name}` en tu chat de Telegram.")
+                st.error("⚠️ Error al conectar con Supabase.")
 
         if st.button("🤖 Ejecutar Ronda Completa de TODAS las Series Guardadas", use_container_width=True):
-            send_remote_telegram_command("/producir_todas")
-            st.success("🚀 Ronda multi-serie activada en segundo plano.")
+            if saved_scripts_list:
+                for s_item in saved_scripts_list:
+                    enqueue_background_production(s_item["title"], s_item.get("language", "Español"))
+                st.success(f"🚀 {len(saved_scripts_list)} series enviadas a la cola de Render en segundo plano.")
+            else:
+                st.warning("⚠️ No tienes series guardadas en la Biblioteca aún.")
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 2: BIBLIOTECA Y RETRATO OFICIAL DE PERSONAJE
@@ -313,7 +316,7 @@ with tabs[1]:
                 with st.spinner(f"Creando escaleta en {script_lang}..."):
                     try:
                         prompt_s = f"Crea un guion de {num_caps} capítulos conectados con cliffhangers para '{new_title}' escrito totalmente en {script_lang}. Premisa: {idea}. Detalla Capítulo 1 al {num_caps}."
-                        generated_text = call_gemini_api(ENGINE_CONFIG["gemini_key"], [{"text": prompt_s}], timeout=35)
+                        generated_text = call_gemini_api(ENGINE_CONFIG["gemini_key"], [{"text": prompt_s}], timeout=40)
                         st.session_state["draft_script"] = generated_text
                         st.session_state["draft_title"] = new_title
                         st.session_state["draft_char"] = char_visual
