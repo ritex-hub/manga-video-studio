@@ -105,7 +105,7 @@ def discover_gemini_models(key_clean: str, headers: dict):
             pass
     return discovered
 
-def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
+def call_gemini_api(gemini_key: str, parts: list, timeout: int = 45, force_json: bool = False):
     if not gemini_key or not gemini_key.strip():
         raise ValueError("Falta configurar la Gemini API Key en Secrets.")
 
@@ -126,10 +126,14 @@ def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
         if ep not in endpoints:
             endpoints.append(ep)
 
+    payload = {"contents": [{"parts": parts}]}
+    if force_json:
+        payload["generationConfig"] = {"responseMimeType": "application/json"}
+
     last_err = ""
     for url in endpoints:
         try:
-            res = requests.post(url, headers=headers, json={"contents": [{"parts": parts}]}, timeout=timeout)
+            res = requests.post(url, headers=headers, json=payload, timeout=timeout)
             data = res.json()
             if "candidates" in data and data["candidates"]:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -138,6 +142,17 @@ def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
             last_err = str(e)
 
     raise RuntimeError(f"Error de Gemini API: {last_err}")
+
+def parse_safe_json(raw_text: str) -> dict:
+    clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
+    try:
+        return json.loads(clean)
+    except Exception:
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        if match:
+            fixed = re.sub(r",\s*([\]}])", r"\1", match.group(0))
+            return json.loads(fixed)
+        raise
 
 def translate_prompt_to_english(text: str, gemini_key: str) -> str:
     if not text or not gemini_key:
@@ -594,11 +609,11 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     {master_ref}
     Asigna roles usando SOLO: NARRADOR, PROTAGONISTA, CHICA, VILLANO.
     Los campos 'prompt' y 'sfx_query' DEBEN ir en inglés; 'hook_banner', 'description' y 'dialogues[].text' DEBEN ir en {target_lang}.
-    Responde ÚNICAMENTE en JSON válido:
+    Devuelve un objeto JSON con exactamente esta estructura:
     {{
       "title": "{series_name} - Cap. {next_chap}",
-      "hook_banner": "Hook corto de máximo 5 palabras en {target_lang}",
-      "description": "Resumen breve en {target_lang} de lo ocurrido en este capítulo",
+      "hook_banner": "Hook corto de maximo 5 palabras en {target_lang}",
+      "description": "Resumen breve en {target_lang} de lo ocurrido en este capitulo",
       "hashtags": "#manhwa #anime #webtoon #fyp",
       "mood_music": "cyberpunk dark synth epic action",
       "scenes": [
@@ -607,7 +622,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
           "sfx_query": "sword unsheath",
           "dialogues": [
             {{"role": "NARRADOR", "text": "Texto narrado en {target_lang}"}},
-            {{"role": "PROTAGONISTA", "text": "Diálogo del héroe en {target_lang}"}}
+            {{"role": "PROTAGONISTA", "text": "Dialogo del heroe en {target_lang}"}}
           ]
         }},
         {{
@@ -615,7 +630,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
           "sfx_query": "thunder explosion",
           "dialogues": [
             {{"role": "VILLANO", "text": "Amenaza del enemigo en {target_lang}"}},
-            {{"role": "CHICA", "text": "Reacción de aliada en {target_lang}"}}
+            {{"role": "CHICA", "text": "Reaccion de aliada en {target_lang}"}}
           ]
         }},
         {{
@@ -623,14 +638,14 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
           "sfx_query": "energy blast",
           "dialogues": [
             {{"role": "PROTAGONISTA", "text": "Ataque final en {target_lang}"}},
-            {{"role": "NARRADOR", "text": "Gancho final del capítulo en {target_lang}"}}
+            {{"role": "NARRADOR", "text": "Gancho final del capitulo en {target_lang}"}}
           ]
         }}
       ]
     }}
     """
-    txt = call_gemini_api(gemini_key, [{"text": gem_prompt}], timeout=40)
-    script_data = json.loads(re.search(r"\{.*\}", txt, re.DOTALL).group(0))
+    txt = call_gemini_api(gemini_key, [{"text": gem_prompt}], timeout=45, force_json=True)
+    script_data = parse_safe_json(txt)
 
     title = script_data["title"]
     hook_text = script_data.get("hook_banner", f"CAP. {next_chap}")
