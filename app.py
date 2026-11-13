@@ -141,14 +141,26 @@ def enqueue_background_production(series_name: str, language: str = "Español"):
     """Encola la serie directamente en Supabase para que Render la produzca en segundo plano."""
     sb_url, sb_key = ENGINE_CONFIG["sb_url"], ENGINE_CONFIG["sb_key"]
     if not sb_url or not sb_key:
-        return False
+        return False, "Faltan credenciales de Supabase en Secrets."
     next_chap, _ = get_series_continuity(sb_url, sb_key, series_name)
-    ep_id = save_episode_to_supabase(
-        sb_url, sb_key, series_name, next_chap,
-        f"{series_name} - Cap. {next_chap}",
-        f"LANG:{language}", "#manhwa #anime", "QUEUED", "", status="queued"
-    )
-    return ep_id > 0
+    endpoint = f"{sb_url.rstrip('/')}/rest/v1/manga_episodes"
+    payload = {
+        "series_name": series_name,
+        "chapter_num": next_chap,
+        "title": f"{series_name} - Cap. {next_chap}",
+        "description": f"LANG:{language}",
+        "hashtags": "#manhwa #anime",
+        "prompt": "QUEUED",
+        "narration": "",
+        "status": "queued"
+    }
+    try:
+        r = requests.post(endpoint, headers=get_sb_headers(sb_key), json=payload, timeout=10)
+        if r.status_code in [200, 201]:
+            return True, "OK"
+        return False, f"HTTP {r.status_code}: {r.text}"
+    except Exception as e:
+        return False, str(e)
 
 # ==============================================================================
 # BARRA LATERAL COMPLETA
@@ -279,16 +291,23 @@ with tabs[0]:
                     st.error(f"⚠️ {e}")
 
         if b2.button("☁️ Producir en Segundo Plano (Render)", use_container_width=True):
-            if enqueue_background_production(series_name, prod_lang):
+            ok_q, msg_q = enqueue_background_production(series_name, prod_lang)
+            if ok_q:
                 st.success(f"🚀 Capítulo #{next_chap} de '{series_name}' ({prod_lang}) enviado a Render. Te llegará a @MangaStudioPro_bot al terminar.")
             else:
-                st.error("⚠️ Error al conectar con Supabase.")
+                st.error(f"⚠️ Error al conectar con Supabase: {msg_q}")
 
         if st.button("🤖 Ejecutar Ronda Completa de TODAS las Series Guardadas", use_container_width=True):
             if saved_scripts_list:
+                queued_count = 0
                 for s_item in saved_scripts_list:
-                    enqueue_background_production(s_item["title"], s_item.get("language", "Español"))
-                st.success(f"🚀 {len(saved_scripts_list)} series enviadas a la cola de Render en segundo plano.")
+                    ok_item, _ = enqueue_background_production(s_item["title"], s_item.get("language", "Español"))
+                    if ok_item:
+                        queued_count += 1
+                if queued_count > 0:
+                    st.success(f"🚀 {queued_count} series enviadas a la cola de Render en segundo plano.")
+                else:
+                    st.error("⚠️ No se pudieron encolar las series en Supabase. Verifica los permisos SQL.")
             else:
                 st.warning("⚠️ No tienes series guardadas en la Biblioteca aún.")
 
