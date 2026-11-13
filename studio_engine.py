@@ -1,6 +1,7 @@
 import os
 import re
 import gc
+import time
 import json
 import base64
 import asyncio
@@ -277,7 +278,7 @@ def generate_character_portrait(char_prompt: str, hf_token: str, gemini_key: str
             api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
             headers = {"Authorization": f"Bearer {hf_token.strip()}"}
             res = requests.post(api_url, headers=headers, json={"inputs": full_p}, timeout=45)
-            if res.status_code == 200:
+            if res.status_code == 200 and len(res.content) > 1000:
                 with open(out_path, "wb") as f:
                     f.write(res.content)
                 return out_path
@@ -286,13 +287,36 @@ def generate_character_portrait(char_prompt: str, hf_token: str, gemini_key: str
     try:
         encoded = urllib.parse.quote(full_p)
         r = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=1024&nologo=true&model=flux", timeout=40)
-        if r.status_code == 200:
+        if r.status_code == 200 and len(r.content) > 1000:
             with open(out_path, "wb") as f:
                 f.write(r.content)
             return out_path
     except Exception:
         pass
     return None
+
+def create_fallback_manhwa_frame(output_path: str, seed: int = 42):
+    """Genera un fondo vertical 720x1280 estilo manhwa oscuro si las APIs de imagen fallan."""
+    w, h = 720, 1280
+    img = Image.new("RGB", (w, h), (15, 18, 30))
+    draw = ImageDraw.Draw(img)
+    rng = np.random.default_rng(seed)
+
+    for y in range(h):
+        r = int(12 + (y / h) * 28)
+        g = int(16 + (y / h) * 18)
+        b = int(34 + (y / h) * 55)
+        draw.line([(0, y), (w, y)], fill=(r, g, b))
+
+    accent = (0, 210, 255) if seed % 2 == 0 else (180, 40, 255)
+    for _ in range(35):
+        x0 = int(rng.integers(0, w))
+        y0 = int(rng.integers(0, h))
+        length = int(rng.integers(80, 320))
+        draw.line([(x0, y0), (x0, min(h, y0 + length))], fill=accent, width=2)
+
+    img.save(output_path, "PNG")
+    return True
 
 def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str, hf_token: str, output_path: str, seed: int = 42):
     full_prompt = f"{char_anchor}, {prompt}, manhwa action style, detailed comic line art, vibrant cinematic lighting, vertical 9:16 composition"
@@ -306,7 +330,7 @@ def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str
                 img_b64 = base64.b64encode(r_ref.content).decode("utf-8")
                 payload = {"inputs": full_prompt, "parameters": {"image": img_b64, "image_guidance_scale": 1.4}}
                 res = requests.post(i2i_url, headers=headers, json=payload, timeout=45)
-                if res.status_code == 200:
+                if res.status_code == 200 and len(res.content) > 1000:
                     with open(output_path, "wb") as f:
                         f.write(res.content)
                     return True
@@ -318,23 +342,25 @@ def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str
             api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
             headers = {"Authorization": f"Bearer {hf_token.strip()}"}
             res = requests.post(api_url, headers=headers, json={"inputs": full_prompt, "parameters": {"seed": seed}}, timeout=40)
-            if res.status_code == 200:
+            if res.status_code == 200 and len(res.content) > 1000:
                 with open(output_path, "wb") as f:
                     f.write(res.content)
                 return True
         except Exception:
             pass
 
-    try:
-        encoded = urllib.parse.quote(full_prompt)
-        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1280&seed={seed}&nologo=true&model=flux", timeout=40)
-        if r_poll.status_code == 200:
-            with open(output_path, "wb") as f:
-                f.write(r_poll.content)
-            return True
-    except Exception:
-        pass
-    return False
+    for attempt in range(2):
+        try:
+            encoded = urllib.parse.quote(full_prompt)
+            r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1280&seed={seed + attempt}&nologo=true&model=flux", timeout=45)
+            if r_poll.status_code == 200 and len(r_poll.content) > 1000:
+                with open(output_path, "wb") as f:
+                    f.write(r_poll.content)
+                return True
+        except Exception:
+            time.sleep(2)
+
+    return create_fallback_manhwa_frame(output_path, seed=seed)
 
 def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_dur: int, output_path: str):
     if not freesound_key or not query_tags:
