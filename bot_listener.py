@@ -51,12 +51,13 @@ ENGINE_CONFIG = {
 }
 
 def send_tg_text(chat_id, text):
+    print(f"[TG] {text}", flush=True)
     if not TG_API_BASE:
         return
     try:
         requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TG ERROR] {e}", flush=True)
 
 def get_episode_from_db(episode_id: str):
     if not SB_URL or not SB_KEY:
@@ -89,6 +90,7 @@ def delete_queue_placeholder(episode_id):
 
 def supabase_queue_worker():
     """Revisa cada 10 segundos si Streamlit encoló una serie con status='queued'."""
+    print("[WORKER] Cola de Supabase iniciada y escuchando...", flush=True)
     while True:
         time.sleep(10)
         if not (SB_URL and SB_KEY and GEMINI_KEY):
@@ -110,14 +112,15 @@ def supabase_queue_worker():
                         series_name=s_name,
                         custom_direction=f"Continúa la trama principal de {s_name} con acción intensa y un cliffhanger.",
                         config=ENGINE_CONFIG,
-                        language_override=lang_ov
+                        language_override=lang_ov,
+                        progress_callback=lambda msg: send_tg_text(CHAT_ID, msg)
                     )
                     delete_queue_placeholder(job_id)
                 except Exception as e:
                     update_supabase_status(job_id, "error")
                     send_tg_text(CHAT_ID, f"❌ Error produciendo '{s_name}': {e}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WORKER ERROR] {e}", flush=True)
 
 threading.Thread(target=supabase_queue_worker, daemon=True).start()
 
@@ -141,9 +144,9 @@ def execute_tiktok_publish(episode_id: str, chat_id: int, message_id: int):
 
     if ok_tk:
         update_supabase_status(episode_id, "published")
-        caption_res = f"✅ **Episodio #{episode_id} enviado a TikTok**\n{msg_tk}"
+        caption_res = f"✅ Episodio #{episode_id} enviado a TikTok\n{msg_tk}"
     else:
-        caption_res = f"⚠️ **Aviso TikTok (Ep. #{episode_id}):** {msg_tk}"
+        caption_res = f"⚠️ Aviso TikTok (Ep. #{episode_id}): {msg_tk}"
 
     requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": caption_res}, timeout=10)
 
@@ -159,12 +162,13 @@ def get_all_saved_series():
     return []
 
 def trigger_single_production(series_name: str, chat_id):
-    send_tg_text(chat_id, f"⏳ Produciendo '{series_name}' (Memoria Visual + SFX + Multi-Voz)...")
+    send_tg_text(chat_id, f"⏳ Produciendo '{series_name}' (720p HD + Memoria Visual + SFX)...")
     try:
         _, title, chap = produce_series_episode(
             series_name=series_name,
             custom_direction=f"Continúa la trama principal de {series_name} con acción intensa y un cliffhanger.",
-            config=ENGINE_CONFIG
+            config=ENGINE_CONFIG,
+            progress_callback=lambda msg: send_tg_text(chat_id, msg)
         )
         send_tg_text(chat_id, f"✅ ¡{title} listo! El próximo será el Capítulo #{chap + 1}.")
     except Exception as e:
@@ -197,12 +201,14 @@ threading.Thread(target=daily_autopilot_scheduler, daemon=True).start()
 
 def start_polling():
     if not TG_API_BASE:
+        print("[ERROR] Falta TELEGRAM_BOT_TOKEN", flush=True)
         return
     try:
         requests.get(f"{TG_API_BASE}/deleteWebhook", timeout=10)
     except Exception:
         pass
 
+    print("[TELEGRAM] Polling iniciado para @MangaStudioPro_bot...", flush=True)
     offset = 0
     while True:
         try:
@@ -219,7 +225,7 @@ def start_polling():
                     c_id = update["message"]["chat"]["id"]
 
                     if msg_text == "/start":
-                        send_tg_text(c_id, "🎬 ¡Bienvenido a Manga Studio Pro!\n\nComandos disponibles:\n• `/producir_todas` — Produce el siguiente capítulo de todas tus series.\n• `/producir Nombre de la Serie` — Produce una serie específica.")
+                        send_tg_text(c_id, "🎬 ¡Bienvenido a Manga Studio Pro!\n\nComandos disponibles:\n• /producir_todas — Produce el siguiente capítulo de todas tus series.\n• /producir Nombre de la Serie — Produce una serie específica.")
                     elif msg_text == "/producir_todas":
                         threading.Thread(target=trigger_all_series_production, args=(c_id,), daemon=True).start()
                     elif msg_text.startswith("/producir"):
@@ -228,8 +234,8 @@ def start_polling():
                             threading.Thread(target=trigger_single_production, args=(s_name, c_id), daemon=True).start()
                         else:
                             series_avail = get_all_saved_series()
-                            lista = "\n".join([f"• `/producir {s}`" for s in series_avail]) if series_avail else "Ninguna serie guardada aún."
-                            send_tg_text(c_id, f"📚 Series disponibles:\n{lista}\n\nO usa `/producir_todas`")
+                            lista = "\n".join([f"• /producir {s}" for s in series_avail]) if series_avail else "Ninguna serie guardada aún."
+                            send_tg_text(c_id, f"📚 Series disponibles:\n{lista}\n\nO usa /producir_todas")
 
                 if "callback_query" in update:
                     cb = update["callback_query"]
