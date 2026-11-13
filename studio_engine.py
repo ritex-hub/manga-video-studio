@@ -6,6 +6,7 @@ import json
 import base64
 import asyncio
 import shutil
+import subprocess
 import urllib.parse
 import requests
 import numpy as np
@@ -729,32 +730,30 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
         rendered_files.append(mp4_f)
         gc.collect()
 
-    log("🎞️ Uniendo las 3 escenas y mezclando música BGM...")
-    clips = [VideoFileClip(p) for p in rendered_files]
-    final_vid = concatenate_videoclips(clips, method="compose")
-    bgm_p = get_freesound_audio(fs_key, mood, 25, 120, "/tmp/bgm_main.mp3")
-    bgm = None
-    if bgm_p and os.path.exists(bgm_p):
-        bgm = AudioFileClip(bgm_p).volumex(0.13)
-        bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
-        final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
-
+    log("🎞️ Uniendo las 3 escenas y mezclando música BGM (Modo Ultra-Ligero)...")
     out_final = f"/tmp/cap_{next_chap}_final.mp4"
-    final_vid.write_videofile(
-        out_final,
-        fps=24,
-        codec="libx264",
-        audio_codec="aac",
-        preset="ultrafast",
-        threads=1,
-        verbose=False,
-        logger=None
-    )
-    final_vid.close()
-    if bgm:
-        bgm.close()
-    for c in clips:
-        c.close()
+    concat_list_path = "/tmp/concat_list.txt"
+    with open(concat_list_path, "w") as f_list:
+        for p in rendered_files:
+            f_list.write(f"file '{p}'\n")
+
+    bgm_p = get_freesound_audio(fs_key, mood, 15, 45, "/tmp/bgm_main.mp3")
+    if bgm_p and os.path.exists(bgm_p):
+        cmd_ffmpeg = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-stream_loop", "-1", "-i", bgm_p,
+            "-filter_complex", "[1:a]volume=0.13[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            out_final
+        ]
+    else:
+        cmd_ffmpeg = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c", "copy", out_final
+        ]
+
+    subprocess.run(cmd_ffmpeg, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     gc.collect()
 
     log("☁️ Subiendo video final a Supabase Storage y enviando a Telegram...")
