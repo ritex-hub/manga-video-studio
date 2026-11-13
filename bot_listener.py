@@ -15,7 +15,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Manga Studio Pro Worker (TikTok + Multi-Series Auto-Pilot) LIVE!")
+        self.wfile.write(b"MangaStudioPro_bot Worker (Queue + TikTok + Auto-Pilot) LIVE!")
 
     def log_message(self, format, *args):
         return
@@ -69,7 +69,7 @@ def get_episode_from_db(episode_id: str):
         pass
     return None
 
-def update_supabase_status(episode_id: str, new_status: str):
+def update_supabase_status(episode_id, new_status: str):
     if not SB_URL or not SB_KEY:
         return False
     endpoint = f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?id=eq.{episode_id}"
@@ -78,6 +78,48 @@ def update_supabase_status(episode_id: str, new_status: str):
         return r.status_code in [200, 204]
     except Exception:
         return False
+
+def delete_queue_placeholder(episode_id):
+    if not SB_URL or not SB_KEY:
+        return
+    try:
+        requests.delete(f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?id=eq.{episode_id}", headers=get_sb_headers(SB_KEY), timeout=10)
+    except Exception:
+        pass
+
+def supabase_queue_worker():
+    """Revisa cada 10 segundos si Streamlit encoló una serie con status='queued'."""
+    while True:
+        time.sleep(10)
+        if not (SB_URL and SB_KEY and GEMINI_KEY):
+            continue
+        try:
+            url = f"{SB_URL.rstrip('/')}/rest/v1/manga_episodes?status=eq.queued&order=id.asc&limit=1"
+            r = requests.get(url, headers=get_sb_headers(SB_KEY), timeout=10)
+            if r.status_code == 200 and r.json():
+                job = r.json()[0]
+                job_id = job["id"]
+                s_name = job["series_name"]
+                desc_meta = job.get("description", "")
+                lang_ov = desc_meta.replace("LANG:", "").strip() if desc_meta.startswith("LANG:") else ""
+
+                update_supabase_status(job_id, "processing")
+                send_tg_text(CHAT_ID, f"⚙️ Render tomó la orden en segundo plano: '{s_name}'...")
+                try:
+                    _, title, chap = produce_series_episode(
+                        series_name=s_name,
+                        custom_direction=f"Continúa la trama principal de {s_name} con acción intensa y un cliffhanger.",
+                        config=ENGINE_CONFIG,
+                        language_override=lang_ov
+                    )
+                    delete_queue_placeholder(job_id)
+                except Exception as e:
+                    update_supabase_status(job_id, "error")
+                    send_tg_text(CHAT_ID, f"❌ Error produciendo '{s_name}': {e}")
+        except Exception:
+            pass
+
+threading.Thread(target=supabase_queue_worker, daemon=True).start()
 
 def execute_tiktok_publish(episode_id: str, chat_id: int, message_id: int):
     ep = get_episode_from_db(episode_id)
@@ -156,6 +198,11 @@ threading.Thread(target=daily_autopilot_scheduler, daemon=True).start()
 def start_polling():
     if not TG_API_BASE:
         return
+    try:
+        requests.get(f"{TG_API_BASE}/deleteWebhook", timeout=10)
+    except Exception:
+        pass
+
     offset = 0
     while True:
         try:
@@ -171,7 +218,9 @@ def start_polling():
                     msg_text = update["message"]["text"].strip()
                     c_id = update["message"]["chat"]["id"]
 
-                    if msg_text == "/producir_todas":
+                    if msg_text == "/start":
+                        send_tg_text(c_id, "🎬 ¡Bienvenido a Manga Studio Pro!\n\nComandos disponibles:\n• `/producir_todas` — Produce el siguiente capítulo de todas tus series.\n• `/producir Nombre de la Serie` — Produce una serie específica.")
+                    elif msg_text == "/producir_todas":
                         threading.Thread(target=trigger_all_series_production, args=(c_id,), daemon=True).start()
                     elif msg_text.startswith("/producir"):
                         s_name = msg_text.replace("/producir", "").strip()
@@ -198,8 +247,8 @@ def start_polling():
                     elif cb_data.startswith("retry_"):
                         ep_id = cb_data.replace("retry_", "")
                         requests.post(f"{TG_API_BASE}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Encolado"}, timeout=10)
-                        update_supabase_status(ep_id, "queued_retry")
-                        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"⏳ Episodio #{ep_id} marcado para reintento."}, timeout=10)
+                        update_supabase_status(ep_id, "queued")
+                        requests.post(f"{TG_API_BASE}/editMessageCaption", json={"chat_id": chat_id, "message_id": message_id, "caption": f"⏳ Episodio #{ep_id} encolado para regeneración."}, timeout=10)
         except Exception:
             time.sleep(3)
 
