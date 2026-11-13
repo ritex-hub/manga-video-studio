@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import json
 import base64
 import asyncio
@@ -326,7 +327,7 @@ def generate_image_with_memory(prompt: str, char_anchor: str, ref_image_url: str
 
     try:
         encoded = urllib.parse.quote(full_prompt)
-        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&seed={seed}&nologo=true&model=flux", timeout=40)
+        r_poll = requests.get(f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1280&seed={seed}&nologo=true&model=flux", timeout=40)
         if r_poll.status_code == 200:
             with open(output_path, "wb") as f:
                 f.write(r_poll.content)
@@ -422,24 +423,28 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
 
     combined = concatenate_audioclips(temp_clips)
     combined.write_audiofile(final_audio_path, verbose=False, logger=None)
+    combined.close()
     for c in temp_clips:
         c.close()
+    gc.collect()
     return all_subtitles
 
 def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_banner: str = ""):
     draw = ImageDraw.Draw(pil_img)
     w, h = pil_img.size
+    scale = w / 1080.0
 
     if hook_banner and current_time <= 2.5:
         try:
-            h_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
+            h_font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(24, int(48 * scale)))
         except Exception:
             h_font = ImageFont.load_default()
         hb = draw.textbbox((0, 0), hook_banner.upper(), font=h_font)
         hw, hh = hb[2] - hb[0], hb[3] - hb[1]
         hx = (w - hw) // 2
         hy = int(h * 0.14)
-        draw.rectangle([hx - 24, hy - 14, hx + hw + 24, hy + hh + 18], fill=(180, 20, 60))
+        pad_x, pad_y = int(24 * scale), int(14 * scale)
+        draw.rectangle([hx - pad_x, hy - pad_y, hx + hw + pad_x, hy + hh + pad_y], fill=(180, 20, 60))
         draw.text((hx, hy), hook_banner.upper(), font=h_font, fill=(255, 255, 255))
 
     if not subtitles:
@@ -458,7 +463,7 @@ def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_
     chunk = subtitles[chunk_start:chunk_start + 3]
 
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 62)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(28, int(62 * scale)))
     except Exception:
         font = ImageFont.load_default()
 
@@ -468,14 +473,15 @@ def overlay_tiktok_and_hook(pil_img, subtitles: list, current_time: float, hook_
     total_w = bbox[2] - bbox[0]
     x_cursor = (w - total_w) // 2
     y_pos = int(h * 0.78)
+    stroke = max(2, int(4 * scale))
 
     for idx_in_chunk, item in enumerate(chunk):
         w_text = item["word"].upper() + " "
         is_current = (chunk_start + idx_in_chunk) == active_idx
         fill_color = (57, 255, 20) if is_current else (255, 255, 255)
 
-        for dx in range(-4, 5):
-            for dy in range(-4, 5):
+        for dx in range(-stroke, stroke + 1):
+            for dy in range(-stroke, stroke + 1):
                 draw.text((x_cursor + dx, y_pos + dy), w_text, font=font, fill=(0, 0, 0))
         draw.text((x_cursor, y_pos), w_text, font=font, fill=fill_color)
 
@@ -516,11 +522,11 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
     dur = voice_clip.duration + 0.15
 
     if is_video and VideoFileClip:
-        base = VideoFileClip(visual_path)
+        base = VideoFileClip(visual_path).resize((720, 1280))
         base = base.loop(duration=dur) if base.duration < dur else base.subclip(0, dur)
         scene = base.fl(lambda gf, t: np.array(overlay_tiktok_and_hook(Image.fromarray(gf(t)), subtitles, t, hook_banner)))
     else:
-        target_w, target_h = 1080, 1920
+        target_w, target_h = 720, 1280
         b_img = Image.open(visual_path).convert("RGB")
         sc = max(target_w / b_img.width, target_h / b_img.height)
         res = b_img.resize((int(b_img.width * sc), int(b_img.height * sc)), Image.Resampling.LANCZOS)
@@ -528,7 +534,7 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
         crp = res.crop((l, top, l + target_w, top + target_h))
 
         def frame_zoom(t):
-            zf = 1.0 + 0.06 * (t / max(dur, 1))
+            zf = 1.0 + 0.05 * (t / max(dur, 1))
             zw, zh = int(target_w * zf), int(target_h * zf)
             z_img = crp.resize((zw, zh), Image.Resampling.BILINEAR)
             f_img = z_img.crop(((zw - target_w) // 2, (zh - target_h) // 2, (zw + target_w) // 2, (zh + target_h) // 2))
@@ -539,6 +545,7 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
     scene = fadein(scene, 0.25)
 
     audio_tracks = [voice_clip]
+    sfx_clip = None
     if sfx_path and os.path.exists(sfx_path):
         try:
             sfx_clip = AudioFileClip(sfx_path).volumex(0.45)
@@ -548,9 +555,24 @@ def build_scene_clip(visual_path: str, audio_path: str, sfx_path: str, subtitles
         except Exception:
             pass
 
-    scene = scene.set_audio(CompositeAudioClip(audio_tracks))
-    scene.write_videofile(out_mp4, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    final_audio = CompositeAudioClip(audio_tracks)
+    scene = scene.set_audio(final_audio)
+    scene.write_videofile(
+        out_mp4,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        threads=1,
+        verbose=False,
+        logger=None
+    )
+    scene.close()
+    final_audio.close()
     voice_clip.close()
+    if sfx_clip:
+        sfx_clip.close()
+    gc.collect()
     return out_mp4
 
 def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
@@ -578,8 +600,12 @@ def publish_to_tiktok_api(video_path: str, title: str, access_token: str):
 
 def produce_series_episode(series_name: str, custom_direction: str, config: dict, language_override: str = "", progress_callback=None):
     def log(msg):
+        print(msg, flush=True)
         if progress_callback:
-            progress_callback(msg)
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
 
     sb_url = config.get("sb_url", "")
     sb_key = config.get("sb_key", "")
@@ -599,7 +625,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
     ref_img_url = script_obj.get("reference_image_url", "") if script_obj else ""
     master_ref = f"\nGUION MAESTRO:\n{script_obj['script_content'][:2500]}" if script_obj else ""
 
-    log(f"🧠 Escribiendo guion en **{target_lang}** con SFX y Hook para '{series_name}' — Cap. #{next_chap}...")
+    log(f"🧠 Escribiendo guion en {target_lang} para '{series_name}' — Cap. #{next_chap}...")
 
     gem_prompt = f"""
     Eres el director de la serie '{series_name}'. Escribe el CAPÍTULO #{next_chap} en 3 escenas consecutivas.
@@ -675,20 +701,37 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
         banner = hook_text if idx == 0 else ""
         build_scene_clip(anim_f if ok_anim else img_f, aud_f, sfx_path, subs, mp4_f, is_video=ok_anim, hook_banner=banner)
         rendered_files.append(mp4_f)
+        gc.collect()
 
+    log("🎞️ Uniendo las 3 escenas y mezclando música BGM...")
     clips = [VideoFileClip(p) for p in rendered_files]
     final_vid = concatenate_videoclips(clips, method="compose")
     bgm_p = get_freesound_audio(fs_key, mood, 25, 120, "/tmp/bgm_main.mp3")
+    bgm = None
     if bgm_p and os.path.exists(bgm_p):
         bgm = AudioFileClip(bgm_p).volumex(0.13)
         bgm = bgm.loop(duration=final_vid.duration) if bgm.duration < final_vid.duration else bgm.subclip(0, final_vid.duration)
         final_vid = final_vid.set_audio(CompositeAudioClip([final_vid.audio, bgm]))
 
     out_final = f"/tmp/cap_{next_chap}_final.mp4"
-    final_vid.write_videofile(out_final, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    final_vid.write_videofile(
+        out_final,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        threads=1,
+        verbose=False,
+        logger=None
+    )
+    final_vid.close()
+    if bgm:
+        bgm.close()
     for c in clips:
         c.close()
+    gc.collect()
 
+    log("☁️ Subiendo video final a Supabase Storage y enviando a Telegram...")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", series_name)
     public_video_url = upload_to_supabase_storage(sb_url, sb_key, out_final, f"videos/{safe_name}_cap_{next_chap}.mp4", "video/mp4")
 
@@ -708,7 +751,7 @@ def produce_series_episode(series_name: str, custom_direction: str, config: dict
             requests.post(
                 url_tg,
                 files={"video": vf},
-                data={"chat_id": tg_chat.strip(), "caption": f"🎬 **{title}** [{target_lang}]\n{desc}\n{tags}", "reply_markup": json.dumps(keyboard)},
+                data={"chat_id": tg_chat.strip(), "caption": f"🎬 {title} [{target_lang}]\n{desc}\n{tags}", "reply_markup": json.dumps(keyboard)},
                 timeout=90
             )
 
