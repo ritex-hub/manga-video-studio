@@ -91,7 +91,6 @@ def get_sb_headers(sb_key: str):
     }
 
 def discover_gemini_models(key_clean: str, headers: dict):
-    """Consulta a la API de Google qué modelos tiene habilitados exactamente esta clave."""
     discovered = []
     for ver in ["v1beta", "v1"]:
         try:
@@ -107,7 +106,6 @@ def discover_gemini_models(key_clean: str, headers: dict):
     return discovered
 
 def call_gemini_api(gemini_key: str, parts: list, timeout: int = 40):
-    """Toma cualquier API Key tal cual sin exigir formato y detecta automáticamente el modelo disponible."""
     if not gemini_key or not gemini_key.strip():
         raise ValueError("Falta configurar la Gemini API Key en Secrets.")
 
@@ -341,7 +339,6 @@ def get_freesound_audio(freesound_key: str, query_tags: str, min_dur: int, max_d
     return None
 
 def clean_tts_text(raw_text: str) -> str:
-    """Elimina símbolos o etiquetas que hacen que edge-tts rechace el texto."""
     txt = re.sub(r"\[.*?\]", "", raw_text)
     txt = re.sub(r"[*_#~`]", "", txt).strip()
     return txt
@@ -365,7 +362,6 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
         part_words = []
         edge_ok = False
 
-        # 1. Intento principal con Edge-TTS (Multi-voz neuronal)
         if edge_tts:
             try:
                 communicate = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
@@ -382,7 +378,6 @@ async def synthesize_multivoice_speech(dialogue_lines: list, final_audio_path: s
             except Exception:
                 edge_ok = False
 
-        # 2. Respaldo automático con gTTS si Edge-TTS es bloqueado por IP compartida en la nube
         if not edge_ok and gTTS:
             try:
                 tts = gTTS(text=text, lang=gtts_lang, slow=False)
